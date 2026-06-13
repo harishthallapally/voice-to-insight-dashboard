@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Audio To Excel Dashboard",
+  title: "AI voice to insights dashboard",
   description: "Upload conversation audio, transcribe it, and export structured rows to Excel."
 };
 
