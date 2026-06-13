@@ -141,3 +141,10 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+*.wav
+*.mp3
+*.m4a
+*.webm
+*.ogg
+*.pptx
