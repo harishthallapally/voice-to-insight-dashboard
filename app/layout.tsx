@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "AI voice to insights dashboard",
-  description: "Upload conversation audio, transcribe it, and export structured rows to Excel."
+  description: "AI voice to insights dashboard"
 };
 
 export default function RootLayout({
