@@ -57,6 +57,10 @@ textarea {
   width: 100%;
 }
 
+.hero-header h1 {
+  flex: 1 1 auto;
+}
+
 .hero-logo {
   width: clamp(60px, 7vw, 96px);
   height: auto;
@@ -92,6 +96,95 @@ textarea {
   display: grid;
   gap: 1.5rem;
   width: 100%;
+}
+
+.login-shell {
+  display: grid;
+  min-height: calc(100vh - 7rem);
+  place-items: center;
+}
+
+.login-panel {
+  display: grid;
+  gap: 1rem;
+  width: min(100%, 28rem);
+  padding: 2rem;
+  border: 1px solid var(--line);
+  border-radius: 28px;
+  background: #ffffff;
+  box-shadow: var(--shadow);
+}
+
+.login-logo {
+  width: 96px;
+  height: auto;
+  justify-self: center;
+}
+
+.login-copy {
+  display: grid;
+  gap: 0.45rem;
+  text-align: center;
+}
+
+.login-copy h1,
+.login-copy p {
+  margin: 0;
+}
+
+.login-copy h1 {
+  color: #0f172a;
+  font-size: 1.25rem;
+  line-height: 1.25;
+}
+
+.login-copy p {
+  color: var(--muted);
+}
+
+.login-field {
+  display: grid;
+  gap: 0.45rem;
+  color: #334155;
+  font-size: 0.96rem;
+}
+
+.login-button {
+  width: 100%;
+}
+
+.signup-panel {
+  width: min(100%, 42rem);
+}
+
+.signup-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.auth-switch {
+  margin: -0.25rem 0 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+  text-align: center;
+}
+
+.auth-link {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.auth-link:hover {
+  text-decoration: underline;
+}
+
+.logout-button {
+  flex: 0 0 auto;
 }
 
 .panel {
@@ -202,12 +295,23 @@ textarea {
 .upload-selected {
   display: inline-flex;
   align-items: center;
+  max-width: min(100%, 34rem);
   padding: 0.45rem 0.8rem;
   border-radius: 999px;
   background: rgba(24, 56, 131, 0.08);
   color: #183883;
   font-size: 0.9rem;
   font-weight: 600;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.upload-selected-list {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  width: 100%;
 }
 
 .label {
@@ -325,6 +429,106 @@ textarea {
   line-height: 1.7;
 }
 
+.results-stack {
+  display: grid;
+  gap: 1rem;
+}
+
+.results-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.results-title {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.results-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.results-header h3,
+.results-header p {
+  margin: 0;
+}
+
+.results-header h3 {
+  font-size: 1.3rem;
+  color: #0f172a;
+}
+
+.results-header p {
+  color: #64748b;
+  font-size: 0.92rem;
+}
+
+.result-list {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.result-item {
+  display: grid;
+  gap: 0.85rem;
+  padding: 1rem;
+  border: 1px solid #dbe3ef;
+  border-radius: 18px;
+  background: #ffffff;
+}
+
+.result-item.is-processing,
+.result-item.is-queued {
+  background: #f8fafc;
+}
+
+.result-item.is-error {
+  border-color: rgba(157, 35, 28, 0.28);
+}
+
+.result-item-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.result-title {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.result-title h4 {
+  margin: 0;
+  color: #0f172a;
+  font-size: 1rem;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.result-meta {
+  margin: 0;
+  color: #64748b;
+  font-size: 0.9rem;
+}
+
+.result-summary {
+  margin: 0;
+  color: #334155;
+  font-size: 0.98rem;
+  line-height: 1.65;
+}
+
+.result-item .status {
+  min-height: auto;
+}
+
 .tool-list {
   display: grid;
   gap: 0.75rem;
@@ -353,6 +557,10 @@ textarea {
     flex-direction: column;
   }
 
+  .hero-header h1 {
+    text-align: left;
+  }
+
   .hero h1 {
     white-space: normal;
   }
@@ -360,5 +568,27 @@ textarea {
   .summary-header {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .results-header,
+  .result-item-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .results-actions {
+    justify-content: flex-start;
+    width: 100%;
+  }
+}
+
+@media (max-width: 640px) {
+  .login-panel {
+    padding: 1.5rem;
+    border-radius: 20px;
+  }
+
+  .signup-grid {
+    grid-template-columns: 1fr;
   }
 }

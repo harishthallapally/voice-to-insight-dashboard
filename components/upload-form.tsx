@@ -1,6 +1,8 @@
 "use client";
 
-import { useRef, useState, useTransition } from "react";
+import { useRef, useState } from "react";
+
+import { resolveDriverHierarchy } from "@/lib/driver-taxonomy";
 
 type ResultPayload = {
   fileName: string;
@@ -8,6 +10,65 @@ type ResultPayload = {
   summary: string;
   workbookBase64: string;
 };
+
+type AudioJobPayload = {
+  id: string;
+  inputFileName: string;
+  status: UploadItemStatus;
+  result?: Partial<ResultPayload>;
+  error?: string;
+};
+
+type UploadItemStatus = "queued" | "processing" | "complete" | "error";
+
+type UploadItem = {
+  id: string;
+  jobId?: string;
+  inputFileName: string;
+  status: UploadItemStatus;
+  result?: ResultPayload;
+  error?: string;
+};
+
+type ConversationDataRow = Record<string, unknown>;
+
+type ConsolidatedRow = {
+  "S.No": number;
+  "Frame No": string;
+  "Product Rating": string;
+  "Connected Features Rating": string;
+  "Charger Rating": string;
+  "Voice Of Customer": string;
+  "L3 Driver": string;
+  "L2 Driver": string;
+  "L1 Driver": string;
+};
+
+const conversationDataHeaders = [
+  "Speaker",
+  "Topic",
+  "Customer Name",
+  "Sentiement",
+  "Transcription",
+  "Notes",
+  "L3 Driver",
+  "L2 Driver",
+  "L1 Driver",
+  "Rating",
+  "Next Step"
+];
+
+const consolidatedHeaders = [
+  "S.No",
+  "Frame No",
+  "Product Rating",
+  "Connected Features Rating",
+  "Charger Rating",
+  "Voice Of Customer",
+  "L3 Driver",
+  "L2 Driver",
+  "L1 Driver"
+];
 
 class ProcessError extends Error {
   payload?: Partial<ResultPayload>;
@@ -19,9 +80,46 @@ class ProcessError extends Error {
   }
 }
 
-function downloadWorkbook(fileName: string, workbookBase64: string) {
+function normalizeResultPayload(payload: Partial<ResultPayload>): ResultPayload {
+  return {
+    fileName: payload.fileName || "",
+    transcriptionProvider: payload.transcriptionProvider || "unknown",
+    summary: payload.summary || "",
+    workbookBase64: payload.workbookBase64 || ""
+  };
+}
+
+function normalizeJobPayload(payload: Partial<AudioJobPayload>): AudioJobPayload {
+  return {
+    id: payload.id || "",
+    inputFileName: payload.inputFileName || "",
+    status: payload.status || "queued",
+    result: payload.result,
+    error: payload.error || ""
+  };
+}
+
+function buildUploadId(file: File, index: number) {
+  return `${file.name}-${file.size}-${file.lastModified}-${index}`;
+}
+
+function getSelectedAudioFiles(files: FileList | File[] | null | undefined) {
+  return files
+    ? Array.from(files).filter((file) => file.size > 0)
+    : [];
+}
+
+function base64ToUint8Array(workbookBase64: string) {
   const binary = atob(workbookBase64);
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function downloadWorkbook(fileName: string, workbookBase64: string) {
+  const bytes = base64ToUint8Array(workbookBase64);
   const blob = new Blob([bytes], {
     type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
   });
@@ -34,56 +132,547 @@ function downloadWorkbook(fileName: string, workbookBase64: string) {
   URL.revokeObjectURL(url);
 }
 
+function downloadAllWorkbooks(items: UploadItem[]) {
+  const downloadableItems = items.filter(
+    (item) => item.result?.fileName && item.result.workbookBase64
+  );
+
+  if (!downloadableItems.length) {
+    throw new Error("No Excel files are available to download.");
+  }
+
+  downloadableItems.forEach((item) => {
+    downloadWorkbook(
+      item.result?.fileName || "conversation-data.xlsx",
+      item.result?.workbookBase64 || ""
+    );
+  });
+}
+
+function getCellText(row: ConversationDataRow, columnName: string) {
+  const value = row[columnName];
+
+  if (value === null || value === undefined) {
+    return "";
+  }
+
+  return String(value).trim();
+}
+
+function getRatingColumn(row: ConversationDataRow) {
+  const rowContext = [
+    getCellText(row, "Topic"),
+    getCellText(row, "Notes"),
+    getCellText(row, "L3 Driver"),
+    getCellText(row, "Transcription")
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  if (/\b(charger|charging|charge)\b/.test(rowContext)) {
+    return "Charger Rating";
+  }
+
+  if (
+    /\b(connected|connectivity|mobile app|mobile application|app|maps?|bluetooth|navigation|gps|phone|pairing|telematics|smartxconnect|smart xonnect)\b/.test(
+      rowContext
+    )
+  ) {
+    return "Connected Features Rating";
+  }
+
+  if (
+    /\b(product|vehicle|two wheeler|bike|scooter|overall|ride|motor|performance|brake|battery|range)\b/.test(
+      rowContext
+    )
+  ) {
+    return "Product Rating";
+  }
+
+  return "";
+}
+
+function getDriverAndRatingValues(row: ConversationDataRow) {
+  const hierarchy = resolveDriverHierarchy({
+    speaker: getCellText(row, "Speaker"),
+    l3Driver: getCellText(row, "L3 Driver"),
+    l2Driver: getCellText(row, "L2 Driver"),
+    l1Driver: getCellText(row, "L1 Driver"),
+    sentiment: getCellText(row, "Sentiement"),
+    topic: getCellText(row, "Topic"),
+    notes: getCellText(row, "Notes"),
+    transcription: getCellText(row, "Transcription")
+  });
+
+  return {
+    rating: getCellText(row, "Rating"),
+    l3Driver: getCellText(row, "L3 Driver"),
+    l2Driver: hierarchy.l2Driver,
+    l1Driver: hierarchy.l1Driver
+  };
+}
+
+function hasDriverOrRatingData(row: ConversationDataRow) {
+  const values = getDriverAndRatingValues(row);
+
+  return Boolean(
+    values.rating || values.l3Driver || values.l2Driver || values.l1Driver
+  );
+}
+
+function buildFilteredConversationRows(rows: ConversationDataRow[]) {
+  return rows
+    .filter(hasDriverOrRatingData)
+    .map((row): ConversationDataRow => {
+      const values = getDriverAndRatingValues(row);
+
+      return {
+        ...row,
+        "L3 Driver": values.l3Driver,
+        "L2 Driver": values.l2Driver,
+        "L1 Driver": values.l1Driver,
+        Rating: values.rating
+      };
+    });
+}
+
+function buildConsolidatedRows(params: {
+  frameNo: string;
+  rows: ConversationDataRow[];
+  startIndex: number;
+}) {
+  return buildFilteredConversationRows(params.rows).map(
+    (row, index): ConsolidatedRow => {
+      const { l1Driver, l2Driver, l3Driver, rating } =
+        getDriverAndRatingValues(row);
+      const ratingColumn = rating ? getRatingColumn(row) : "";
+
+      return {
+        "S.No": params.startIndex + index,
+        "Frame No": params.frameNo,
+        "Product Rating": ratingColumn === "Product Rating" ? rating : "",
+        "Connected Features Rating":
+          ratingColumn === "Connected Features Rating" ? rating : "",
+        "Charger Rating": ratingColumn === "Charger Rating" ? rating : "",
+        "Voice Of Customer": getCellText(row, "Notes"),
+        "L3 Driver": l3Driver,
+        "L2 Driver": l2Driver,
+        "L1 Driver": l1Driver
+      };
+    }
+  );
+}
+
+function buildConversationWorksheet(
+  XLSX: typeof import("xlsx"),
+  rows: ConversationDataRow[]
+) {
+  return XLSX.utils.json_to_sheet(rows, {
+    header: conversationDataHeaders
+  });
+}
+
+function buildConsolidatedWorksheet(
+  XLSX: typeof import("xlsx"),
+  rows: ConsolidatedRow[]
+) {
+  return XLSX.utils.json_to_sheet(rows, {
+    header: consolidatedHeaders
+  });
+}
+
+function buildWorksheetName(
+  fileName: string,
+  index: number,
+  usedNames: Set<string>
+) {
+  const fallbackName = `Audio ${index + 1}`;
+  const fileNameWithoutExtension =
+    fileName.replace(/\.[^/.]+$/, "").trim() || fallbackName;
+  const cleanedName =
+    fileNameWithoutExtension
+      .replace(/[\\/?*\[\]:]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim() || fallbackName;
+  let worksheetName = cleanedName.slice(0, 31);
+  let copyNumber = 2;
+
+  while (usedNames.has(worksheetName.toLowerCase())) {
+    const suffix = ` (${copyNumber})`;
+    worksheetName = `${cleanedName.slice(0, 31 - suffix.length)}${suffix}`;
+    copyNumber += 1;
+  }
+
+  usedNames.add(worksheetName.toLowerCase());
+  return worksheetName;
+}
+
+async function downloadConsolidatedWorkbook(items: UploadItem[]) {
+  const XLSX = await import("xlsx");
+  const consolidatedWorkbook = XLSX.utils.book_new();
+  const usedWorksheetNames = new Set<string>(["consolidated"]);
+  const consolidatedRows: ConsolidatedRow[] = [];
+  let worksheetCount = 0;
+
+  for (const [index, item] of items.entries()) {
+    const workbookBase64 = item.result?.workbookBase64;
+
+    if (!workbookBase64) {
+      continue;
+    }
+
+    const workbook = XLSX.read(base64ToUint8Array(workbookBase64), {
+      type: "array"
+    });
+    const worksheet = workbook.Sheets["Conversation Data"];
+
+    if (!worksheet) {
+      throw new Error(
+        `Conversation Data sheet was not found for ${item.inputFileName}.`
+      );
+    }
+
+    const sheetRows = XLSX.utils.sheet_to_json<ConversationDataRow>(
+      worksheet,
+      {
+        defval: ""
+      }
+    );
+    const filteredSheetRows = buildFilteredConversationRows(sheetRows);
+
+    consolidatedRows.push(
+      ...buildConsolidatedRows({
+        frameNo: item.inputFileName,
+        rows: filteredSheetRows,
+        startIndex: consolidatedRows.length + 1
+      })
+    );
+
+    XLSX.utils.book_append_sheet(
+      consolidatedWorkbook,
+      buildConversationWorksheet(XLSX, filteredSheetRows),
+      buildWorksheetName(item.inputFileName, index, usedWorksheetNames)
+    );
+    worksheetCount += 1;
+  }
+
+  if (!worksheetCount) {
+    throw new Error("No Conversation Data sheets are available to consolidate.");
+  }
+
+  const consolidatedWorksheet = buildConsolidatedWorksheet(
+    XLSX,
+    consolidatedRows
+  );
+  XLSX.utils.book_append_sheet(
+    consolidatedWorkbook,
+    consolidatedWorksheet,
+    "Consolidated"
+  );
+  consolidatedWorkbook.SheetNames = [
+    "Consolidated",
+    ...consolidatedWorkbook.SheetNames.filter(
+      (sheetName) => sheetName !== "Consolidated"
+    )
+  ];
+
+  const workbookArray = XLSX.write(consolidatedWorkbook, {
+    bookType: "xlsx",
+    type: "array"
+  });
+  const blob = new Blob([workbookArray], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+  });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+
+  anchor.href = url;
+  anchor.download = "consolidated-conversation-data.xlsx";
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+async function prepareAudioFiles(files: File[]) {
+  const prepared: File[] = [];
+
+  for (const file of files) {
+    const buffer = await file.arrayBuffer();
+
+    if (!buffer.byteLength) {
+      throw new Error(`Could not read audio data for ${file.name}.`);
+    }
+
+    if (buffer.byteLength !== file.size && file.size > 0) {
+      throw new Error(
+        `Audio file ${file.name} was not fully read (${buffer.byteLength} of ${file.size} bytes).`
+      );
+    }
+
+    prepared.push(
+      new File([buffer], file.name, {
+        type: file.type || "audio/mpeg"
+      })
+    );
+  }
+
+  return prepared;
+}
+
+async function submitAudioJob(file: File) {
+  const formData = new FormData();
+  formData.set("audio", file, file.name);
+
+  const response = await fetch("/api/jobs", {
+    method: "POST",
+    headers: {
+      "X-Original-File-Size": String(file.size)
+    },
+    body: formData
+  });
+
+  const payload = await response.json();
+
+  if (!response.ok) {
+    throw new ProcessError(
+      payload.error || `Could not queue ${file.name}.`,
+      normalizeResultPayload(payload)
+    );
+  }
+
+  return normalizeJobPayload(payload.job);
+}
+
+async function fetchAudioJob(jobId: string) {
+  const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+    cache: "no-store"
+  });
+  const payload = await response.json();
+
+  if (!response.ok) {
+    throw new ProcessError(payload.error || "Could not read job status.");
+  }
+
+  return normalizeJobPayload(payload.job);
+}
+
+async function pollAudioJob(
+  jobId: string,
+  onJobUpdate: (job: AudioJobPayload) => void
+) {
+  while (true) {
+    const job = await fetchAudioJob(jobId);
+    onJobUpdate(job);
+
+    if (job.status === "complete") {
+      return normalizeResultPayload(job.result || {});
+    }
+
+    if (job.status === "error") {
+      throw new ProcessError(
+        job.error || "Audio processing failed.",
+        normalizeResultPayload(job.result || {})
+      );
+    }
+
+    await sleep(2500);
+  }
+}
+
 export function UploadForm() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const [result, setResult] = useState<ResultPayload | null>(null);
+  const [items, setItems] = useState<UploadItem[]>([]);
   const [error, setError] = useState<string>("");
-  const [isPending, startTransition] = useTransition();
-  const [selectedFileName, setSelectedFileName] = useState<string>("");
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [selectedFileNames, setSelectedFileNames] = useState<string[]>([]);
   const [isDragActive, setIsDragActive] = useState(false);
+  const [isPreparingFiles, setIsPreparingFiles] = useState(false);
+  const [isBuildingConsolidated, setIsBuildingConsolidated] = useState(false);
 
-  function resetOutputForNewFile(fileName: string) {
-    setSelectedFileName(fileName);
-    setResult(null);
+  const completedCount = items.filter(
+    (item) => item.status === "complete" || item.status === "error"
+  ).length;
+  const isConsolidatedReady =
+    items.length > 0 &&
+    items.every(
+      (item) => item.status === "complete" && item.result?.workbookBase64
+    );
+
+  function resetOutputForNewFiles(fileNames: string[]) {
+    setSelectedFileNames(fileNames);
+    setItems([]);
     setError("");
   }
 
-  function updateSelectedFile(file: File | null) {
-    resetOutputForNewFile(file?.name || "");
+  function updateSelectedFiles(files: FileList | File[] | null) {
+    const nextFiles = getSelectedAudioFiles(files);
+    resetOutputForNewFiles(nextFiles.map((file) => file.name));
+    setSelectedFiles([]);
+
+    void (async () => {
+      setIsPreparingFiles(true);
+
+      try {
+        const preparedFiles = await prepareAudioFiles(nextFiles);
+        setSelectedFiles(preparedFiles);
+      } catch (prepareError) {
+        setSelectedFiles([]);
+        setError(
+          prepareError instanceof Error
+            ? prepareError.message
+            : "Could not read one or more selected audio files."
+        );
+      } finally {
+        setIsPreparingFiles(false);
+      }
+    })();
   }
 
-  function handleDrop(file: File | null) {
-    if (!file || !fileInputRef.current) {
+  function handleDrop(files: FileList | null) {
+    if (!files?.length || !fileInputRef.current) {
       return;
     }
 
     const transfer = new DataTransfer();
-    transfer.items.add(file);
-    fileInputRef.current.files = transfer.files;
-    updateSelectedFile(file);
-  }
 
-  async function handleSubmit(formData: FormData) {
-    setError("");
-    setResult(null);
-
-    const response = await fetch("/api/process", {
-      method: "POST",
-      body: formData
+    Array.from(files).forEach((file) => {
+      transfer.items.add(file);
     });
 
-    const payload = await response.json();
+    fileInputRef.current.files = transfer.files;
+    updateSelectedFiles(transfer.files);
+  }
 
-    if (!response.ok) {
-      throw new ProcessError(payload.error || "Processing failed.", {
-        fileName: payload.fileName || "",
-        transcriptionProvider: payload.transcriptionProvider || "",
-        summary: payload.summary || "",
-        workbookBase64: payload.workbookBase64 || ""
-      });
+  async function handleSubmit(files: File[]) {
+    setError("");
+
+    if (!files.length) {
+      setItems([]);
+      setError("Please select at least one audio file.");
+      return;
     }
 
-    setResult(payload);
+    const nextItems: UploadItem[] = files.map((file, index) => ({
+      id: buildUploadId(file, index),
+      inputFileName: file.name,
+      status: "queued"
+    }));
+
+    setItems(nextItems);
+    setIsProcessing(true);
+
+    try {
+      const preparedFiles = await prepareAudioFiles(files);
+      const jobTrackers: Array<Promise<void>> = [];
+
+      for (const [index, file] of preparedFiles.entries()) {
+        const itemId = nextItems[index].id;
+
+        try {
+          const job = await submitAudioJob(file);
+
+          setItems((currentItems) =>
+            currentItems.map((item) =>
+              item.id === itemId
+                ? {
+                    ...item,
+                    jobId: job.id,
+                    status: job.status,
+                    result: job.result
+                      ? normalizeResultPayload(job.result)
+                      : undefined,
+                    error: job.error || ""
+                  }
+                : item
+            )
+          );
+
+          jobTrackers.push(
+            pollAudioJob(job.id, (updatedJob) => {
+              setItems((currentItems) =>
+                currentItems.map((item) =>
+                  item.id === itemId
+                    ? {
+                        ...item,
+                        status: updatedJob.status,
+                        result: updatedJob.result
+                          ? normalizeResultPayload(updatedJob.result)
+                          : item.result,
+                        error: updatedJob.error || ""
+                      }
+                    : item
+                )
+              );
+            })
+              .then((result) => {
+                setItems((currentItems) =>
+                  currentItems.map((item) =>
+                    item.id === itemId
+                      ? { ...item, status: "complete", result, error: "" }
+                      : item
+                  )
+                );
+              })
+              .catch((itemError) => {
+                const payload =
+                  itemError instanceof ProcessError
+                    ? itemError.payload
+                    : undefined;
+                const result = payload
+                  ? normalizeResultPayload(payload)
+                  : undefined;
+
+                setItems((currentItems) =>
+                  currentItems.map((item) =>
+                    item.id === itemId
+                      ? {
+                          ...item,
+                          status: "error",
+                          result,
+                          error:
+                            itemError instanceof Error
+                              ? itemError.message
+                              : `Unexpected processing error for ${file.name}.`
+                        }
+                      : item
+                  )
+                );
+              })
+          );
+        } catch (itemError) {
+          const payload =
+            itemError instanceof ProcessError ? itemError.payload : undefined;
+          const result = payload ? normalizeResultPayload(payload) : undefined;
+
+          setItems((currentItems) =>
+            currentItems.map((item) =>
+              item.id === itemId
+                ? {
+                    ...item,
+                    status: "error",
+                    result,
+                    error:
+                      itemError instanceof Error
+                        ? itemError.message
+                        : `Unexpected upload error for ${file.name}.`
+                  }
+                : item
+            )
+          );
+        }
+      }
+
+      await Promise.allSettled(jobTrackers);
+    } catch (prepareError) {
+      setItems([]);
+      setError(
+        prepareError instanceof Error
+          ? prepareError.message
+          : "Could not prepare selected audio files."
+      );
+    } finally {
+      setIsProcessing(false);
+    }
   }
 
   return (
@@ -92,33 +681,29 @@ export function UploadForm() {
         <div className="panel-inner stack">
           <form
             className="form-grid"
-            action={(formData) =>
-              startTransition(async () => {
+            noValidate
+            onSubmit={(event) => {
+              event.preventDefault();
+
+              const files =
+                selectedFiles.length > 0
+                  ? selectedFiles
+                  : getSelectedAudioFiles(fileInputRef.current?.files);
+
+              void (async () => {
                 try {
-                  await handleSubmit(formData);
+                  await handleSubmit(files);
                 } catch (submitError) {
-                  if (submitError instanceof ProcessError) {
-                    const payload = submitError.payload ?? {};
-
-                    setResult({
-                      fileName: payload.fileName || "",
-                      transcriptionProvider:
-                        payload.transcriptionProvider || "unknown",
-                      summary: payload.summary || "",
-                      workbookBase64: payload.workbookBase64 || ""
-                    });
-                  } else {
-                    setResult(null);
-                  }
-
+                  setIsProcessing(false);
+                  setItems([]);
                   setError(
                     submitError instanceof Error
                       ? submitError.message
                       : "Unexpected upload error."
                   );
                 }
-              })
-            }
+              })();
+            }}
           >
             <section className="upload-card">
               <div className="upload-copy">
@@ -149,7 +734,7 @@ export function UploadForm() {
                 onDrop={(event) => {
                   event.preventDefault();
                   setIsDragActive(false);
-                  handleDrop(event.dataTransfer.files?.[0] || null);
+                  handleDrop(event.dataTransfer.files || null);
                 }}
               >
                 <input
@@ -159,9 +744,9 @@ export function UploadForm() {
                   type="file"
                   name="audio"
                   accept="audio/*"
-                  required
+                  multiple
                   onChange={(event) => {
-                    updateSelectedFile(event.target.files?.[0] || null);
+                    updateSelectedFiles(event.target.files);
                   }}
                 />
                 <span className="upload-icon" aria-hidden="true">
@@ -197,27 +782,37 @@ export function UploadForm() {
                 <span className="upload-subtitle">
                   Supported audio formats MP3, WAV, M4A
                 </span>
-                {selectedFileName ? (
-                  <span className="upload-selected">{selectedFileName}</span>
+                {selectedFileNames.length ? (
+                  <span className="upload-selected-list">
+                    {selectedFileNames.map((fileName, index) => (
+                      <span
+                        className="upload-selected"
+                        key={`${fileName}-${index}`}
+                      >
+                        {fileName}
+                      </span>
+                    ))}
+                  </span>
                 ) : null}
               </label>
             </section>
 
             <div className="button-row">
-              <button className="button button-primary" type="submit" disabled={isPending}>
-                {isPending ? "Processing..." : "Submit"}
+              <button
+                className="button button-primary"
+                type="submit"
+                disabled={
+                  isProcessing ||
+                  isPreparingFiles ||
+                  (selectedFileNames.length > 0 && selectedFiles.length === 0)
+                }
+              >
+                {isPreparingFiles
+                  ? "Loading files..."
+                  : isProcessing
+                    ? "Processing..."
+                    : "Submit"}
               </button>
-              {result?.workbookBase64 && !isPending ? (
-                <button
-                  className="button button-secondary"
-                  type="button"
-                  onClick={() =>
-                    downloadWorkbook(result.fileName, result.workbookBase64)
-                  }
-                >
-                  Download Excel
-                </button>
-              ) : null}
             </div>
 
             <p className={`status ${error ? "error" : ""}`}>
@@ -229,19 +824,126 @@ export function UploadForm() {
 
       <section className="panel">
         <div className="panel-inner">
-          {result ? (
-            <>
-              <section className="summary-panel">
-                <div className="summary-header">
-                  <h3>Transcription Summary</h3>
+          {items.length ? (
+            <section className="results-stack">
+              <div className="results-header">
+                <div className="results-title">
+                  <h3>Processed Files</h3>
+                  <p>
+                    {completedCount} of {items.length} complete
+                  </p>
                 </div>
-                <p className="summary-text">{result.summary}</p>
-              </section>
-            </>
+                <div className="results-actions">
+                  <button
+                    className="button button-secondary"
+                    type="button"
+                    disabled={!isConsolidatedReady}
+                    title={
+                      isConsolidatedReady
+                        ? "Download every individual Excel file"
+                        : "Available after every file completes successfully"
+                    }
+                    onClick={() => {
+                      try {
+                        setError("");
+                        downloadAllWorkbooks(items);
+                      } catch (downloadError) {
+                        setError(
+                          downloadError instanceof Error
+                            ? downloadError.message
+                            : "Could not download the Excel files."
+                        );
+                      }
+                    }}
+                  >
+                    Download All Excel
+                  </button>
+                  <button
+                    className="button button-secondary"
+                    type="button"
+                    disabled={!isConsolidatedReady || isBuildingConsolidated}
+                    title={
+                      isConsolidatedReady
+                        ? "Download one Consolidated tab plus each file's Conversation Data tab"
+                        : "Available after every file completes successfully"
+                    }
+                    onClick={() => {
+                      void (async () => {
+                        setError("");
+                        setIsBuildingConsolidated(true);
+
+                        try {
+                          await downloadConsolidatedWorkbook(items);
+                        } catch (consolidationError) {
+                          setError(
+                            consolidationError instanceof Error
+                              ? consolidationError.message
+                              : "Could not build the consolidated Excel file."
+                          );
+                        } finally {
+                          setIsBuildingConsolidated(false);
+                        }
+                      })();
+                    }}
+                  >
+                    {isBuildingConsolidated
+                      ? "Preparing..."
+                      : "Download Consolidated Excel"}
+                  </button>
+                </div>
+              </div>
+
+              <div className="result-list">
+                {items.map((item) => (
+                  <article
+                    className={`result-item is-${item.status}`}
+                    key={item.id}
+                  >
+                    <div className="result-item-header">
+                      <div className="result-title">
+                        <h4>{item.inputFileName}</h4>
+                        <p className="result-meta">
+                          {item.status === "complete"
+                            ? "Excel ready"
+                            : item.status === "error"
+                              ? "Needs attention"
+                              : item.status === "processing"
+                                ? "Processing"
+                                : "Queued"}
+                        </p>
+                      </div>
+
+                      {item.result?.workbookBase64 ? (
+                        <button
+                          className="button button-secondary"
+                          type="button"
+                          onClick={() =>
+                            downloadWorkbook(
+                              item.result?.fileName || "conversation-data.xlsx",
+                              item.result?.workbookBase64 || ""
+                            )
+                          }
+                        >
+                          Download Excel
+                        </button>
+                      ) : null}
+                    </div>
+
+                    {item.result?.summary ? (
+                      <p className="result-summary">{item.result.summary}</p>
+                    ) : null}
+
+                    {item.error ? (
+                      <p className="status error">{item.error}</p>
+                    ) : null}
+                  </article>
+                ))}
+              </div>
+            </section>
           ) : (
             <p className="status">
-              No processed audio yet. After upload, this panel will show the
-              transcription summary.
+              No processed audio yet. After upload, this panel will show each
+              file with its Excel download.
             </p>
           )}
         </div>

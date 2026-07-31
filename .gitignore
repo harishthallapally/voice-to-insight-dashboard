@@ -147,4 +147,19 @@ vite.config.ts.timestamp-*
 *.m4a
 *.webm
 *.ogg
+
+# Generated document and presentation artifacts
+*.doc
+*.docx
+*.ppt
 *.pptx
+*.pps
+*.ppsx
+~$*.doc
+~$*.docx
+~$*.ppt
+~$*.pptx
+artifacts/
+outputs/
+scripts/
+work/presentations/

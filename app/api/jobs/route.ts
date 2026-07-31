@@ -1,14 +1,15 @@
 import { NextResponse } from "next/server";
 
-import {
-  AudioProcessingError,
-  processAudioBuffer
-} from "@/lib/audio-processing";
+import { enqueueAudioProcessingJob } from "@/lib/audio-job-queue";
 
 export const runtime = "nodejs";
-export const maxDuration = 300;
+export const maxDuration = 60;
 
 const UPLOAD_TRUNCATION_TOLERANCE = 0.95;
+
+function buildTruncationError(receivedBytes: number, declaredBytes: number) {
+  return `Upload was truncated on the server (${Math.round(receivedBytes / (1024 * 1024))} MB of ${Math.round(declaredBytes / (1024 * 1024))} MB received). Increase the upload body size limit or split the audio into smaller files.`;
+}
 
 export async function POST(request: Request) {
   try {
@@ -38,9 +39,7 @@ export async function POST(request: Request) {
       audioFile.size < declaredFileSize * UPLOAD_TRUNCATION_TOLERANCE
     ) {
       return NextResponse.json(
-        {
-          error: `Upload was truncated on the server (${Math.round(audioFile.size / (1024 * 1024))} MB of ${Math.round(declaredFileSize / (1024 * 1024))} MB received). Increase the Next.js upload body size limit or split the audio into smaller files.`
-        },
+        { error: buildTruncationError(audioFile.size, declaredFileSize) },
         { status: 413 }
       );
     }
@@ -59,29 +58,20 @@ export async function POST(request: Request) {
       audioBuffer.byteLength < declaredFileSize * UPLOAD_TRUNCATION_TOLERANCE
     ) {
       return NextResponse.json(
-        {
-          error: `Upload was truncated on the server (${Math.round(audioBuffer.byteLength / (1024 * 1024))} MB of ${Math.round(declaredFileSize / (1024 * 1024))} MB received). Increase the Next.js upload body size limit or split the audio into smaller files.`
-        },
+        { error: buildTruncationError(audioBuffer.byteLength, declaredFileSize) },
         { status: 413 }
       );
     }
 
-    return NextResponse.json(
-      await processAudioBuffer({
-        audioBuffer,
-        fileName: audioFile.name
-      })
-    );
-  } catch (error) {
-    if (error instanceof AudioProcessingError) {
-      return NextResponse.json(
-        { error: error.message, ...error.payload },
-        { status: 500 }
-      );
-    }
+    const job = await enqueueAudioProcessingJob({
+      audioBuffer,
+      fileName: audioFile.name
+    });
 
+    return NextResponse.json({ job }, { status: 202 });
+  } catch (error) {
     const message =
-      error instanceof Error ? error.message : "Unexpected processing error.";
+      error instanceof Error ? error.message : "Unexpected enqueue error.";
 
     return NextResponse.json({ error: message }, { status: 500 });
   }
