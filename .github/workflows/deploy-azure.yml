@@ -1,0 +1,82 @@
+name: Deploy Azure App Service
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  IMAGE_NAME: voice-to-insight-dashboard
+
+jobs:
+  build-and-deploy:
+    name: Build and deploy Docker image
+    runs-on: ubuntu-latest
+
+    env:
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+      AZURE_APP_NAME: ${{ vars.AZURE_APP_NAME }}
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Validate deployment variables
+        run: |
+          : "${ACR_NAME:?Missing GitHub variable ACR_NAME}"
+          : "${ACR_LOGIN_SERVER:?Missing GitHub variable ACR_LOGIN_SERVER}"
+          : "${AZURE_APP_NAME:?Missing GitHub variable AZURE_APP_NAME}"
+          : "${AZURE_RESOURCE_GROUP:?Missing GitHub variable AZURE_RESOURCE_GROUP}"
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to Azure Container Registry
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t "$ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA}" \
+            -t "$ACR_LOGIN_SERVER/$IMAGE_NAME:uat" \
+            .
+
+      - name: Push Docker image
+        run: |
+          docker push "$ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA}"
+          docker push "$ACR_LOGIN_SERVER/$IMAGE_NAME:uat"
+
+      - name: Configure App Service container
+        run: |
+          az webapp config set \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_APP_NAME" \
+            --generic-configurations '{"acrUseManagedIdentityCreds": true}'
+
+          az webapp config appsettings set \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_APP_NAME" \
+            --settings WEBSITES_PORT=3000
+
+          az webapp config container set \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_APP_NAME" \
+            --container-image-name "$ACR_LOGIN_SERVER/$IMAGE_NAME:${GITHUB_SHA}" \
+            --docker-registry-server-url "https://$ACR_LOGIN_SERVER"
+
+      - name: Restart App Service
+        run: |
+          az webapp restart \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$AZURE_APP_NAME"
