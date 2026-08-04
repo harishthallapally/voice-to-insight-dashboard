@@ -1,4 +1,5 @@
 import { extractRowsFromTranscript, transcribeAudioBuffer } from "@/lib/ai";
+import { buildDriverMetrics, type DriverMetrics } from "@/lib/driver-metrics";
 import { buildWorkbook } from "@/lib/excel";
 
 export type AudioProcessingResult = {
@@ -6,6 +7,7 @@ export type AudioProcessingResult = {
   transcriptionProvider: string;
   summary: string;
   workbookBase64: string;
+  driverMetrics: DriverMetrics;
 };
 
 export class AudioProcessingError extends Error {
@@ -52,12 +54,14 @@ export async function processAudioBuffer(params: {
     );
   }
 
+  const driverMetrics = buildDriverMetrics(rows);
   const workbookBuffer = buildWorkbook(rows, summary);
 
   return {
     fileName: `${params.fileName.replace(/\.[^/.]+$/, "") || "conversation"}-data.xlsx`,
     transcriptionProvider: transcription.provider,
     summary,
-    workbookBase64: workbookBuffer.toString("base64")
+    workbookBase64: workbookBuffer.toString("base64"),
+    driverMetrics
   };
 }

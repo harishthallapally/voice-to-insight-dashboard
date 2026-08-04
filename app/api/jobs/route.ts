@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { enqueueAudioProcessingJob } from "@/lib/audio-job-queue";
+import { safeRecordUploadMetricEvent } from "@/lib/dashboard-metrics-store";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -67,6 +68,7 @@ export async function POST(request: Request) {
       audioBuffer,
       fileName: audioFile.name
     });
+    await safeRecordUploadMetricEvent("upload", audioFile.name);
 
     return NextResponse.json({ job }, { status: 202 });
   } catch (error) {

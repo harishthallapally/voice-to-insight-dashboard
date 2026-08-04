@@ -8,6 +8,10 @@ import {
   type AudioProcessingResult,
   processAudioBuffer
 } from "@/lib/audio-processing";
+import {
+  safeRecordDriverMetricCounts,
+  safeRecordUploadMetricEvent
+} from "@/lib/dashboard-metrics-store";
 
 export type AudioJobStatus = "queued" | "processing" | "complete" | "error";
 
@@ -168,6 +172,8 @@ async function runJob(jobId: string) {
       result,
       error: ""
     });
+    await safeRecordUploadMetricEvent("success", job.inputFileName);
+    await safeRecordDriverMetricCounts(result.driverMetrics, job.inputFileName);
   } catch (error) {
     if (error instanceof AudioProcessingError) {
       updateJob(jobId, {
@@ -176,6 +182,7 @@ async function runJob(jobId: string) {
         error: error.message,
         result: error.payload
       });
+      await safeRecordUploadMetricEvent("failure", job.inputFileName);
       return;
     }
 
@@ -185,6 +192,7 @@ async function runJob(jobId: string) {
       error:
         error instanceof Error ? error.message : "Unexpected processing error."
     });
+    await safeRecordUploadMetricEvent("failure", job.inputFileName);
   } finally {
     await removeAudioFile(job.filePath);
   }

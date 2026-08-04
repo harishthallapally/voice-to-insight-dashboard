@@ -3,12 +3,32 @@
 import { useRef, useState } from "react";
 
 import { resolveDriverHierarchy } from "@/lib/driver-taxonomy";
+import { recordLocalUploadStats } from "@/lib/upload-stats";
 
 type ResultPayload = {
   fileName: string;
   transcriptionProvider: string;
   summary: string;
   workbookBase64: string;
+  driverMetrics?: {
+    detractorCount?: number;
+    l3Drivers?: Array<{
+      driver: string;
+      count: number;
+    }>;
+    l2Drivers?: Array<{
+      driver: string;
+      count: number;
+    }>;
+    l1Drivers?: Array<{
+      driver: string;
+      count: number;
+    }>;
+    vehicleVariants?: Array<{
+      driver: string;
+      count: number;
+    }>;
+  };
 };
 
 type AudioJobPayload = {
@@ -42,6 +62,12 @@ type ConsolidatedRow = {
   "L3 Driver": string;
   "L2 Driver": string;
   "L1 Driver": string;
+};
+
+type StatisticCard = {
+  label: string;
+  value: string | number;
+  tone?: "neutral" | "success" | "warning" | "danger";
 };
 
 const conversationDataHeaders = [
@@ -85,7 +111,8 @@ function normalizeResultPayload(payload: Partial<ResultPayload>): ResultPayload 
     fileName: payload.fileName || "",
     transcriptionProvider: payload.transcriptionProvider || "unknown",
     summary: payload.summary || "",
-    workbookBase64: payload.workbookBase64 || ""
+    workbookBase64: payload.workbookBase64 || "",
+    driverMetrics: payload.driverMetrics
   };
 }
 
@@ -116,6 +143,18 @@ function base64ToUint8Array(workbookBase64: string) {
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatFileSize(bytes: number) {
+  if (!bytes) {
+    return "0 MB";
+  }
+
+  if (bytes < 1024 * 1024) {
+    return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  }
+
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function downloadWorkbook(fileName: string, workbookBase64: string) {
@@ -489,9 +528,64 @@ export function UploadForm() {
   const [isPreparingFiles, setIsPreparingFiles] = useState(false);
   const [isBuildingConsolidated, setIsBuildingConsolidated] = useState(false);
 
-  const completedCount = items.filter(
+  const finishedCount = items.filter(
     (item) => item.status === "complete" || item.status === "error"
   ).length;
+  const queuedCount = items.filter((item) => item.status === "queued").length;
+  const processingCount = items.filter(
+    (item) => item.status === "processing"
+  ).length;
+  const excelReadyCount = items.filter(
+    (item) => item.status === "complete" && item.result?.workbookBase64
+  ).length;
+  const failedCount = items.filter((item) => item.status === "error").length;
+  const selectedFileCount = selectedFiles.length || selectedFileNames.length;
+  const dashboardFileCount = items.length || selectedFileCount;
+  const totalSelectedBytes = selectedFiles.reduce(
+    (totalBytes, file) => totalBytes + file.size,
+    0
+  );
+  const progressPercent = items.length
+    ? Math.round((finishedCount / items.length) * 100)
+    : 0;
+  const dashboardStatus = items.length
+    ? isProcessing
+      ? "Processing batch"
+      : failedCount
+        ? "Completed with errors"
+        : "Completed"
+    : selectedFileCount
+      ? "Ready to submit"
+      : "Waiting for files";
+  const statistics: StatisticCard[] = [
+    {
+      label: "Files Selected",
+      value: dashboardFileCount
+    },
+    {
+      label: "Queued",
+      value: queuedCount
+    },
+    {
+      label: "Processing",
+      value: processingCount,
+      tone: processingCount ? "warning" : "neutral"
+    },
+    {
+      label: "Excel Ready",
+      value: excelReadyCount,
+      tone: excelReadyCount ? "success" : "neutral"
+    },
+    {
+      label: "Failed",
+      value: failedCount,
+      tone: failedCount ? "danger" : "neutral"
+    },
+    {
+      label: "Batch Size",
+      value: formatFileSize(totalSelectedBytes)
+    }
+  ];
   const isConsolidatedReady =
     items.length > 0 &&
     items.every(
@@ -570,6 +664,7 @@ export function UploadForm() {
 
         try {
           const job = await submitAudioJob(file);
+          recordLocalUploadStats({ uploads: 1 });
 
           setItems((currentItems) =>
             currentItems.map((item) =>
@@ -605,6 +700,10 @@ export function UploadForm() {
               );
             })
               .then((result) => {
+                recordLocalUploadStats({
+                  successes: 1,
+                  driverMetrics: result.driverMetrics
+                });
                 setItems((currentItems) =>
                   currentItems.map((item) =>
                     item.id === itemId
@@ -614,6 +713,7 @@ export function UploadForm() {
                 );
               })
               .catch((itemError) => {
+                recordLocalUploadStats({ failures: 1 });
                 const payload =
                   itemError instanceof ProcessError
                     ? itemError.payload
@@ -640,6 +740,7 @@ export function UploadForm() {
               })
           );
         } catch (itemError) {
+          recordLocalUploadStats({ failures: 1 });
           const payload =
             itemError instanceof ProcessError ? itemError.payload : undefined;
           const result = payload ? normalizeResultPayload(payload) : undefined;
@@ -823,6 +924,37 @@ export function UploadForm() {
       </section>
 
       <section className="panel">
+        <div className="panel-inner statistics-dashboard">
+          <div className="statistics-header">
+            <div>
+              <h3>Statistics Dashboard</h3>
+              <p>{dashboardStatus}</p>
+            </div>
+            <strong>{progressPercent}%</strong>
+          </div>
+
+          <div
+            className="statistics-progress"
+            aria-label={`Batch progress ${progressPercent}%`}
+          >
+            <span style={{ width: `${progressPercent}%` }} />
+          </div>
+
+          <div className="statistics-grid">
+            {statistics.map((stat) => (
+              <article
+                className={`statistic-card is-${stat.tone || "neutral"}`}
+                key={stat.label}
+              >
+                <span>{stat.label}</span>
+                <strong>{stat.value}</strong>
+              </article>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <section className="panel">
         <div className="panel-inner">
           {items.length ? (
             <section className="results-stack">
@@ -830,7 +962,7 @@ export function UploadForm() {
                 <div className="results-title">
                   <h3>Processed Files</h3>
                   <p>
-                    {completedCount} of {items.length} complete
+                    {finishedCount} of {items.length} finished
                   </p>
                 </div>
                 <div className="results-actions">
