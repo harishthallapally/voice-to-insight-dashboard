@@ -2,40 +2,38 @@ import { randomUUID } from "node:crypto";
 
 import { CosmosClient, type Container } from "@azure/cosmos";
 
-import type { DateCount, DriverCount, DriverMetrics } from "@/lib/driver-metrics";
+import {
+  recordDriverMetricCountsLocal,
+  recordUploadMetricEventLocal
+} from "@/lib/dashboard-metrics-local-store";
+import {
+  type DriverMetricLevel,
+  type MonthlyUploadMetrics,
+  type UploadMetricEventType,
+  type UploadStatusTrendPoint
+} from "@/lib/dashboard-metrics-types";
+import {
+  calculateNpsScore,
+  type DateCount,
+  type DriverCount,
+  type DriverMetrics,
+  type NpsMetrics
+} from "@/lib/driver-metrics";
+
+export type {
+  DateNpsMetric,
+  DriverMetricLevel,
+  MonthlyUploadMetrics,
+  UploadMetricEventType,
+  UploadStatusTrendPoint
+} from "@/lib/dashboard-metrics-types";
 
 const DEFAULT_ORGANIZATION_ID = "tvs";
 const METRIC_RECORD_TYPE = "uploadMetricEvent";
 const DRIVER_METRIC_RECORD_TYPE = "driverMetricCount";
 const DETRACTOR_METRIC_RECORD_TYPE = "detractorMetricCount";
 const VEHICLE_VARIANT_METRIC_RECORD_TYPE = "vehicleVariantMetricCount";
-
-export type UploadMetricEventType = "upload" | "success" | "failure";
-export type DriverMetricLevel = "l1" | "l2" | "l3";
-
-export type UploadStatusTrendPoint = {
-  date: string;
-  uploads: number;
-  successes: number;
-  failures: number;
-};
-
-export type MonthlyUploadMetrics = {
-  monthKey: string;
-  uploads: number;
-  successes: number;
-  failures: number;
-  uploadStatusByDate: UploadStatusTrendPoint[];
-  detractorsByDate: DateCount[];
-  l3DriversByDate: DateCount[];
-  l2DriversByDate: DateCount[];
-  l1DriversByDate: DateCount[];
-  l3Drivers: DriverCount[];
-  l2Drivers: DriverCount[];
-  l1Drivers: DriverCount[];
-  vehicleVariants: DriverCount[];
-  updatedAt: string | null;
-};
+const CONNECTED_FEATURES_NPS_RECORD_TYPE = "connectedFeaturesNpsMetric";
 
 type CosmosMetricsConfig = {
   endpoint: string;
@@ -54,6 +52,7 @@ type UploadMetricEventRecord = {
   fileName: string;
   dateKey: string;
   createdAt: string;
+  email: string;
 };
 
 type DriverMetricRecord = {
@@ -67,6 +66,7 @@ type DriverMetricRecord = {
   fileName: string;
   dateKey: string;
   createdAt: string;
+  email: string;
 };
 
 type DetractorMetricRecord = {
@@ -78,6 +78,7 @@ type DetractorMetricRecord = {
   count: number;
   fileName: string;
   createdAt: string;
+  email: string;
 };
 
 type VehicleVariantMetricRecord = {
@@ -90,6 +91,22 @@ type VehicleVariantMetricRecord = {
   fileName: string;
   dateKey: string;
   createdAt: string;
+  email: string;
+};
+
+type ConnectedFeaturesNpsMetricRecord = {
+  id: string;
+  type: typeof CONNECTED_FEATURES_NPS_RECORD_TYPE;
+  organizationId: string;
+  monthKey: string;
+  promoters: number;
+  passives: number;
+  detractors: number;
+  totalResponses: number;
+  fileName: string;
+  dateKey: string;
+  createdAt: string;
+  email: string;
 };
 
 type UploadMetricQueryRow = {
@@ -119,8 +136,37 @@ type VehicleVariantMetricQueryRow = {
   count?: number;
 };
 
+type ConnectedFeaturesNpsMetricQueryRow = {
+  dateKey?: string;
+  createdAt?: string;
+  promoters?: number;
+  passives?: number;
+  detractors?: number;
+  totalResponses?: number;
+};
+
 let cachedContainer: Container | null = null;
 let cachedConfigSignature = "";
+
+/**
+ * The metrics container falls back to the shared "users" container
+ * (AZURE_COSMOS_CONTAINER_ID) whenever a dedicated
+ * AZURE_COSMOS_METRICS_CONTAINER_ID isn't configured. That container has a
+ * unique-key policy on /email for real signup records, and Cosmos DB treats
+ * a *missing* /email path as a single shared "null" value across a
+ * partition — so every metric document (which has no email at all) collides
+ * with the first one ever written and fails with a 409, silently, since
+ * these writes are wrapped in safeRecord*. Giving every metric document its
+ * own obviously-synthetic, per-record-unique email value satisfies that
+ * constraint without touching real user records.
+ *
+ * The proper long-term fix is a dedicated AZURE_COSMOS_METRICS_CONTAINER_ID
+ * (see .env.example) with no unique-key policy; this keeps metrics working
+ * in the meantime regardless of which container is configured.
+ */
+function getMetricEmailPlaceholder(id: string) {
+  return `${id}@metrics.internal`;
+}
 
 function getRequiredEnv(name: string) {
   const value = process.env[name]?.trim();
@@ -210,6 +256,8 @@ function createEmptyMonthlyMetrics(monthKey = getCurrentMonthKey()) {
     successes: 0,
     failures: 0,
     uploadStatusByDate: [],
+    connectedFeaturesNps: createNpsMetrics(),
+    connectedFeaturesNpsByDate: [],
     detractorsByDate: [],
     l3DriversByDate: [],
     l2DriversByDate: [],
@@ -220,6 +268,33 @@ function createEmptyMonthlyMetrics(monthKey = getCurrentMonthKey()) {
     vehicleVariants: [],
     updatedAt: null
   };
+}
+
+function createNpsMetrics(params: Partial<NpsMetrics> = {}): NpsMetrics {
+  const promoters = sanitizeMetricCount(params.promoters);
+  const passives = sanitizeMetricCount(params.passives);
+  const detractors = sanitizeMetricCount(params.detractors);
+  const totalResponses = sanitizeMetricCount(
+    params.totalResponses || promoters + passives + detractors
+  );
+
+  return {
+    promoters,
+    passives,
+    detractors,
+    totalResponses,
+    score: calculateNpsScore({
+      promoters,
+      detractors,
+      totalResponses
+    })
+  };
+}
+
+function sanitizeMetricCount(value: unknown) {
+  const count = Number(value || 0);
+
+  return Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
 }
 
 function sortDriverCounts(driverCounts: DriverCount[]) {
@@ -288,6 +363,36 @@ function logMetricWarning(action: string, error: unknown) {
   console.warn(`[dashboard-metrics] ${action} failed: ${message}`);
 }
 
+/**
+ * Local dev runs (`next dev`, NODE_ENV=development) must never write real
+ * metric records into Azure Cosmos — only a real deployment (`next build`
+ * then `next start`, which sets NODE_ENV=production) records by default.
+ * Set DASHBOARD_METRICS_ENABLED explicitly to override either direction,
+ * e.g. to intentionally test the Cosmos write path from a local run.
+ */
+function isMetricsRecordingEnabled() {
+  const override = process.env.DASHBOARD_METRICS_ENABLED?.trim().toLowerCase();
+
+  if (override) {
+    return !["false", "0", "no", "off"].includes(override);
+  }
+
+  return process.env.NODE_ENV === "production";
+}
+
+let hasLoggedMetricsDisabled = false;
+
+function logMetricsDisabledOnce() {
+  if (hasLoggedMetricsDisabled) {
+    return;
+  }
+
+  hasLoggedMetricsDisabled = true;
+  console.info(
+    '[dashboard-metrics] Recording is disabled outside production (NODE_ENV is not "production"). Set DASHBOARD_METRICS_ENABLED=true to record from this environment anyway.'
+  );
+}
+
 export async function recordUploadMetricEvent(
   eventType: UploadMetricEventType,
   fileName = ""
@@ -297,15 +402,17 @@ export async function recordUploadMetricEvent(
   const now = new Date();
   const monthKey = getCurrentMonthKey(now);
   const dateKey = getCurrentDateKey(now);
+  const id = `upload-metric-${monthKey}-${randomUUID()}`;
   const record: UploadMetricEventRecord = {
-    id: `upload-metric-${monthKey}-${randomUUID()}`,
+    id,
     type: METRIC_RECORD_TYPE,
     organizationId: config.organizationId,
     monthKey,
     eventType,
     fileName,
     dateKey,
-    createdAt: now.toISOString()
+    createdAt: now.toISOString(),
+    email: getMetricEmailPlaceholder(id)
   };
 
   await container.items.create(record);
@@ -315,12 +422,26 @@ export async function safeRecordUploadMetricEvent(
   eventType: UploadMetricEventType,
   fileName = ""
 ) {
-  try {
-    await recordUploadMetricEvent(eventType, fileName);
-  } catch (error) {
-    logMetricWarning(`record ${eventType}`, error);
-    // Metrics should never block the actual audio processing flow.
-  }
+  // Azure and local recording are independent flags — either, both, or
+  // neither can be active, and one failing must never affect the other or
+  // block the actual audio processing flow.
+  await Promise.all([
+    (async () => {
+      if (!isMetricsRecordingEnabled()) {
+        logMetricsDisabledOnce();
+        return;
+      }
+
+      try {
+        await recordUploadMetricEvent(eventType, fileName);
+      } catch (error) {
+        logMetricWarning(`record ${eventType}`, error);
+      }
+    })(),
+    recordUploadMetricEventLocal(eventType, fileName).catch((error) => {
+      logMetricWarning(`record ${eventType} locally`, error);
+    })
+  ]);
 }
 
 async function createDriverMetricRecord(params: {
@@ -333,8 +454,9 @@ async function createDriverMetricRecord(params: {
   dateKey: string;
   createdAt: string;
 }) {
+  const id = `driver-metric-${params.monthKey}-${params.level}-${randomUUID()}`;
   const record: DriverMetricRecord = {
-    id: `driver-metric-${params.monthKey}-${params.level}-${randomUUID()}`,
+    id,
     type: DRIVER_METRIC_RECORD_TYPE,
     organizationId: params.config.organizationId,
     monthKey: params.monthKey,
@@ -343,7 +465,8 @@ async function createDriverMetricRecord(params: {
     count: params.driverCount.count,
     fileName: params.fileName,
     dateKey: params.dateKey,
-    createdAt: params.createdAt
+    createdAt: params.createdAt,
+    email: getMetricEmailPlaceholder(id)
   };
 
   await params.container.items.create(record);
@@ -358,8 +481,9 @@ async function createVehicleVariantMetricRecord(params: {
   dateKey: string;
   createdAt: string;
 }) {
+  const id = `vehicle-variant-metric-${params.monthKey}-${randomUUID()}`;
   const record: VehicleVariantMetricRecord = {
-    id: `vehicle-variant-metric-${params.monthKey}-${randomUUID()}`,
+    id,
     type: VEHICLE_VARIANT_METRIC_RECORD_TYPE,
     organizationId: params.config.organizationId,
     monthKey: params.monthKey,
@@ -367,7 +491,8 @@ async function createVehicleVariantMetricRecord(params: {
     count: params.variantCount.count,
     fileName: params.fileName,
     dateKey: params.dateKey,
-    createdAt: params.createdAt
+    createdAt: params.createdAt,
+    email: getMetricEmailPlaceholder(id)
   };
 
   await params.container.items.create(record);
@@ -382,15 +507,45 @@ async function createDetractorMetricRecord(params: {
   dateKey: string;
   createdAt: string;
 }) {
+  const id = `detractor-metric-${params.dateKey}-${randomUUID()}`;
   const record: DetractorMetricRecord = {
-    id: `detractor-metric-${params.dateKey}-${randomUUID()}`,
+    id,
     type: DETRACTOR_METRIC_RECORD_TYPE,
     organizationId: params.config.organizationId,
     monthKey: params.monthKey,
     dateKey: params.dateKey,
     count: params.detractorCount,
     fileName: params.fileName,
-    createdAt: params.createdAt
+    createdAt: params.createdAt,
+    email: getMetricEmailPlaceholder(id)
+  };
+
+  await params.container.items.create(record);
+}
+
+async function createConnectedFeaturesNpsMetricRecord(params: {
+  config: CosmosMetricsConfig;
+  container: Container;
+  npsMetrics: NpsMetrics;
+  fileName: string;
+  monthKey: string;
+  dateKey: string;
+  createdAt: string;
+}) {
+  const id = `connected-features-nps-${params.dateKey}-${randomUUID()}`;
+  const record: ConnectedFeaturesNpsMetricRecord = {
+    id,
+    type: CONNECTED_FEATURES_NPS_RECORD_TYPE,
+    organizationId: params.config.organizationId,
+    monthKey: params.monthKey,
+    promoters: params.npsMetrics.promoters,
+    passives: params.npsMetrics.passives,
+    detractors: params.npsMetrics.detractors,
+    totalResponses: params.npsMetrics.totalResponses,
+    fileName: params.fileName,
+    dateKey: params.dateKey,
+    createdAt: params.createdAt,
+    email: getMetricEmailPlaceholder(id)
   };
 
   await params.container.items.create(record);
@@ -458,6 +613,17 @@ export async function recordDriverMetricCounts(
           dateKey,
           createdAt
         })
+      : Promise.resolve(),
+    driverMetrics.connectedFeaturesNps.totalResponses > 0
+      ? createConnectedFeaturesNpsMetricRecord({
+          config,
+          container,
+          npsMetrics: driverMetrics.connectedFeaturesNps,
+          fileName,
+          monthKey,
+          dateKey,
+          createdAt
+        })
       : Promise.resolve()
   ]);
 }
@@ -470,12 +636,23 @@ export async function safeRecordDriverMetricCounts(
     return;
   }
 
-  try {
-    await recordDriverMetricCounts(driverMetrics, fileName);
-  } catch (error) {
-    logMetricWarning("record driver counts", error);
-    // Metrics should never block the actual audio processing flow.
-  }
+  await Promise.all([
+    (async () => {
+      if (!isMetricsRecordingEnabled()) {
+        logMetricsDisabledOnce();
+        return;
+      }
+
+      try {
+        await recordDriverMetricCounts(driverMetrics, fileName);
+      } catch (error) {
+        logMetricWarning("record driver counts", error);
+      }
+    })(),
+    recordDriverMetricCountsLocal(driverMetrics, fileName).catch((error) => {
+      logMetricWarning("record driver counts locally", error);
+    })
+  ]);
 }
 
 export async function getMonthlyUploadMetrics(monthKey = getCurrentMonthKey()) {
@@ -554,11 +731,30 @@ export async function getMonthlyUploadMetrics(monthKey = getCurrentMonthKey()) {
       }
     ]
   };
+  const connectedFeaturesNpsQuerySpec = {
+    query:
+      "SELECT c.dateKey, c.createdAt, c.promoters, c.passives, c.detractors, c.totalResponses FROM c WHERE c.organizationId = @organizationId AND c.type = @type AND c.monthKey = @monthKey",
+    parameters: [
+      {
+        name: "@organizationId",
+        value: config.organizationId
+      },
+      {
+        name: "@type",
+        value: CONNECTED_FEATURES_NPS_RECORD_TYPE
+      },
+      {
+        name: "@monthKey",
+        value: monthKey
+      }
+    ]
+  };
   const [
     { resources: uploadResources },
     { resources: driverResources },
     { resources: detractorResources },
-    { resources: vehicleVariantResources }
+    { resources: vehicleVariantResources },
+    { resources: connectedFeaturesNpsResources }
   ] = await Promise.all([
     container.items
       .query<UploadMetricQueryRow>(uploadQuerySpec, {
@@ -579,6 +775,14 @@ export async function getMonthlyUploadMetrics(monthKey = getCurrentMonthKey()) {
       .query<VehicleVariantMetricQueryRow>(vehicleVariantQuerySpec, {
         partitionKey: config.organizationId
       })
+      .fetchAll(),
+    container.items
+      .query<ConnectedFeaturesNpsMetricQueryRow>(
+        connectedFeaturesNpsQuerySpec,
+        {
+          partitionKey: config.organizationId
+        }
+      )
       .fetchAll()
   ]);
   const uploadStatusMap = new Map<string, UploadStatusTrendPoint>();
@@ -589,6 +793,8 @@ export async function getMonthlyUploadMetrics(monthKey = getCurrentMonthKey()) {
   const l2DateCounts = new Map<string, number>();
   const l1DateCounts = new Map<string, number>();
   const detractorDateCounts = new Map<string, number>();
+  const connectedFeaturesNpsDateMap = new Map<string, NpsMetrics>();
+  const connectedFeaturesNpsTotals = createNpsMetrics();
 
   function getUploadStatusTrendPoint(date: string) {
     const existingPoint = uploadStatusMap.get(date);
@@ -673,6 +879,29 @@ export async function getMonthlyUploadMetrics(monthKey = getCurrentMonthKey()) {
     }
   }
 
+  for (const row of connectedFeaturesNpsResources) {
+    const date = getDateKeyFromRecord(row);
+    const npsMetrics = createNpsMetrics(row);
+
+    if (!date || npsMetrics.totalResponses <= 0) {
+      continue;
+    }
+
+    const currentDateMetrics =
+      connectedFeaturesNpsDateMap.get(date) ?? createNpsMetrics();
+
+    currentDateMetrics.promoters += npsMetrics.promoters;
+    currentDateMetrics.passives += npsMetrics.passives;
+    currentDateMetrics.detractors += npsMetrics.detractors;
+    currentDateMetrics.totalResponses += npsMetrics.totalResponses;
+    connectedFeaturesNpsDateMap.set(date, currentDateMetrics);
+
+    connectedFeaturesNpsTotals.promoters += npsMetrics.promoters;
+    connectedFeaturesNpsTotals.passives += npsMetrics.passives;
+    connectedFeaturesNpsTotals.detractors += npsMetrics.detractors;
+    connectedFeaturesNpsTotals.totalResponses += npsMetrics.totalResponses;
+  }
+
   for (const row of vehicleVariantResources) {
     const driver = row.variant?.trim();
     const count = Number(row.count || 0);
@@ -685,6 +914,15 @@ export async function getMonthlyUploadMetrics(monthKey = getCurrentMonthKey()) {
   metrics.uploadStatusByDate = sortUploadStatusTrendPoints(
     Array.from(uploadStatusMap.values())
   );
+  metrics.connectedFeaturesNps = createNpsMetrics(connectedFeaturesNpsTotals);
+  metrics.connectedFeaturesNpsByDate = Array.from(
+    connectedFeaturesNpsDateMap.entries()
+  )
+    .map(([date, npsMetrics]) => ({
+      date,
+      ...createNpsMetrics(npsMetrics)
+    }))
+    .sort((left, right) => left.date.localeCompare(right.date));
   metrics.detractorsByDate = toDateCounts(detractorDateCounts);
   metrics.l3DriversByDate = toDateCounts(l3DateCounts);
   metrics.l2DriversByDate = toDateCounts(l2DateCounts);

@@ -148,6 +148,9 @@ vite.config.ts.timestamp-*
 *.webm
 *.ogg
 
+# Local dashboard metrics store (DASHBOARD_LOCAL_METRICS_ENABLED)
+.local-metrics/
+
 # Generated document and presentation artifacts
 *.doc
 *.docx

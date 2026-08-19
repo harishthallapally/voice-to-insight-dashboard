@@ -3,7 +3,7 @@
 import { useRef, useState } from "react";
 
 import { resolveDriverHierarchy } from "@/lib/driver-taxonomy";
-import { recordLocalUploadStats } from "@/lib/upload-stats";
+import { notifyUploadStatsUpdated } from "@/lib/upload-stats";
 
 type ResultPayload = {
   fileName: string;
@@ -28,6 +28,13 @@ type ResultPayload = {
       driver: string;
       count: number;
     }>;
+    connectedFeaturesNps?: {
+      score: number | null;
+      promoters: number;
+      passives: number;
+      detractors: number;
+      totalResponses: number;
+    };
   };
 };
 
@@ -664,7 +671,7 @@ export function UploadForm() {
 
         try {
           const job = await submitAudioJob(file);
-          recordLocalUploadStats({ uploads: 1 });
+          notifyUploadStatsUpdated();
 
           setItems((currentItems) =>
             currentItems.map((item) =>
@@ -700,10 +707,7 @@ export function UploadForm() {
               );
             })
               .then((result) => {
-                recordLocalUploadStats({
-                  successes: 1,
-                  driverMetrics: result.driverMetrics
-                });
+                notifyUploadStatsUpdated();
                 setItems((currentItems) =>
                   currentItems.map((item) =>
                     item.id === itemId
@@ -713,7 +717,7 @@ export function UploadForm() {
                 );
               })
               .catch((itemError) => {
-                recordLocalUploadStats({ failures: 1 });
+                notifyUploadStatsUpdated();
                 const payload =
                   itemError instanceof ProcessError
                     ? itemError.payload
@@ -740,7 +744,7 @@ export function UploadForm() {
               })
           );
         } catch (itemError) {
-          recordLocalUploadStats({ failures: 1 });
+          notifyUploadStatsUpdated();
           const payload =
             itemError instanceof ProcessError ? itemError.payload : undefined;
           const result = payload ? normalizeResultPayload(payload) : undefined;

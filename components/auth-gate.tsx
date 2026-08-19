@@ -2,8 +2,14 @@
 
 import { useEffect, useState } from "react";
 
-import { HomeDashboard } from "@/components/home-dashboard";
 import { UploadForm } from "@/components/upload-form";
+
+// The Dashboard (components/home-dashboard.tsx) is hidden for now — its
+// requirements aren't finalized. Upload is the only screen after login.
+// To bring the Dashboard back: re-import HomeDashboard, restore the
+// AuthView type + authView state below, restore the Home/Upload toggle
+// button in the hero-actions block, and restore the authView-based
+// conditional render at the bottom of the authenticated view.
 
 const AUTH_STORAGE_KEY = "tvs-voice-dashboard-cosmos-authenticated";
 const passwordPattern =
@@ -14,7 +20,6 @@ const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const mobileNumberPattern = /^\d{10}$/;
 
 type AuthMode = "login" | "signup";
-type AuthView = "home" | "upload";
 
 type Feedback = {
   message: string;
@@ -59,7 +64,6 @@ function isValidMobileNumber(mobileNumber: string) {
 export function AuthGate() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authMode, setAuthMode] = useState<AuthMode>("login");
-  const [authView, setAuthView] = useState<AuthView>("home");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [signupForm, setSignupForm] = useState<SignupForm>(emptySignupForm);
@@ -138,7 +142,6 @@ export function AuthGate() {
 
       localStorage.setItem(AUTH_STORAGE_KEY, "true");
       setIsAuthenticated(true);
-      setAuthView("home");
       setPassword("");
     } catch {
       showError("Login failed. Check the connection and try again.");
@@ -219,7 +222,6 @@ export function AuthGate() {
   function handleLogout() {
     localStorage.removeItem(AUTH_STORAGE_KEY);
     setIsAuthenticated(false);
-    setAuthView("home");
     setUsername("");
     setPassword("");
     resetFeedback();
@@ -233,15 +235,6 @@ export function AuthGate() {
             <img className="hero-logo" src="/tvs-logo.svg" alt="TVS logo" />
             <h1>AI-Based Voice-to-Insight System for Connected Feature NPS</h1>
             <div className="hero-actions">
-              {authView === "upload" ? (
-                <button
-                  className="button button-secondary"
-                  type="button"
-                  onClick={() => setAuthView("home")}
-                >
-                  Home
-                </button>
-              ) : null}
               <button
                 className="button button-secondary logout-button"
                 type="button"
@@ -253,11 +246,7 @@ export function AuthGate() {
           </div>
         </section>
 
-        {authView === "home" ? (
-          <HomeDashboard onOpenUpload={() => setAuthView("upload")} />
-        ) : (
-          <UploadForm />
-        )}
+        <UploadForm />
       </>
     );
   }

@@ -39,6 +39,73 @@ async function runFfmpeg(args: string[]) {
   await execFileAsync("ffmpeg", args);
 }
 
+/**
+ * Whisper is trained on 16kHz audio and has no built-in loudness handling.
+ * Raw call recordings are frequently narrow-band (8kHz), quiet, or otherwise
+ * degraded, which can cause the model to lose confidence partway through and
+ * fall into a repeated-phrase hallucination loop instead of transcribing the
+ * remaining speech (silently "succeeding" with garbage text for the rest of
+ * the file). Normalizing loudness, cutting sub-100Hz rumble, and resampling
+ * to 16kHz mono before every transcription request substantially reduces
+ * that failure mode.
+ *
+ * Falls back to the original buffer (rather than throwing) if ffmpeg is
+ * unavailable or preprocessing otherwise fails, so a preprocessing hiccup
+ * never blocks transcription outright.
+ */
+export async function preprocessAudioBufferForTranscription(
+  buffer: Buffer,
+  fileName: string
+): Promise<AudioChunk> {
+  if (!buffer.byteLength) {
+    return { buffer, name: fileName };
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), "whisper-preprocess-"));
+  const inputPath = join(dir, `input${getExtension(fileName)}`);
+  const outputPath = join(dir, "normalized.mp3");
+
+  try {
+    await writeFile(inputPath, buffer);
+
+    await runFfmpeg([
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      inputPath,
+      "-af",
+      "loudnorm=I=-16:TP=-1.5:LRA=11,highpass=f=100",
+      "-ar",
+      "16000",
+      "-ac",
+      "1",
+      "-acodec",
+      "libmp3lame",
+      "-b:a",
+      "128k",
+      outputPath
+    ]);
+
+    const normalizedBuffer = await readFile(outputPath);
+
+    if (!normalizedBuffer.byteLength) {
+      return { buffer, name: fileName };
+    }
+
+    return { buffer: normalizedBuffer, name: "normalized.mp3" };
+  } catch (error) {
+    console.warn(
+      `Audio preprocessing skipped for ${fileName}; sending original audio to transcription.`,
+      error instanceof Error ? error.message : error
+    );
+
+    return { buffer, name: fileName };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 export async function createAudioChunksFromBuffer(
   buffer: Buffer,
   fileName: string

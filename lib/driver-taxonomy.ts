@@ -21,12 +21,12 @@ const OTHERS_DRIVER: DriverHierarchy = {
 
 const VEHICLE_DRIVER: DriverHierarchy = {
   l2Driver: "Vehicle issue",
-  l1Driver: "Vehicle issue"
+  l1Driver: "Others"
 };
 
 const CHARGER_DRIVER: DriverHierarchy = {
   l2Driver: "Charger issue",
-  l1Driver: "Charger issue"
+  l1Driver: "Others"
 };
 
 function normalizeForMatch(value: string) {
@@ -189,6 +189,38 @@ function classifyConnectedFeatureIssue(value: string): DriverHierarchy {
   }
 
   if (/\b(notification|notifications|alert|alerts|call alert|message alert|theft alert|crash alert|fall alert)\b/.test(value)) {
+    if (/\bcrash\b/.test(value)) {
+      if (
+        /\b(false|wrong|incorrect|no crash|didn't crash|did not crash|without crash|accidental|mistaken|falsely)\b/.test(
+          value
+        )
+      ) {
+        return {
+          l2Driver: "False crash alert notification issue",
+          l1Driver: "Crash Alert Issue"
+        };
+      }
+
+      return {
+        l2Driver: "Crash alert notification issue",
+        l1Driver: "Crash Alert Issue"
+      };
+    }
+
+    if (/\btheft\b/.test(value)) {
+      return {
+        l2Driver: "Theft alert notification issue",
+        l1Driver: "Theft Alert Issue"
+      };
+    }
+
+    if (/\bfall\b/.test(value)) {
+      return {
+        l2Driver: "Fall alert notification issue",
+        l1Driver: "Fall Alert Issue"
+      };
+    }
+
     if (/\b(call)\b/.test(value)) {
       return {
         l2Driver: "Call notification issue",

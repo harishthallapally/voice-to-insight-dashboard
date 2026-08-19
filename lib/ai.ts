@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
   createAudioChunksFromBuffer,
   getAudioMimeType,
+  preprocessAudioBufferForTranscription,
   WHISPER_MAX_FILE_BYTES
 } from "@/lib/audio-chunking";
 import { resolveDriverHierarchy } from "@/lib/driver-taxonomy";
@@ -11,6 +12,8 @@ import type { ExtractionRow } from "@/lib/types";
 import { runTranscriptionTask } from "@/lib/transcription-queue";
 
 const { APIError } = OpenAI;
+const DEFAULT_EXTRACTION_CHUNK_CHAR_LIMIT = 12000;
+const MIN_EXTRACTION_CHUNK_CHAR_LIMIT = 4000;
 
 const extractionSchema = z.object({
   rows: z.array(
@@ -162,6 +165,49 @@ function preserveSharedConversationFields(rows: ExtractionRow[]) {
   }));
 }
 
+function normalizeForDuplicateCheck(value: string) {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * A single rating disclosure or complaint often spans more than one
+ * conversation turn (e.g. "I want to give 5" followed by the agent asking
+ * "why 5?", or a complaint stated once and then elaborated on in a follow-up
+ * row). Extraction sometimes echoes the same rating value or the same
+ * l3Driver text onto every row that mentions it, which double-counts a
+ * single event in the dashboard (one rating counted as two NPS responses,
+ * one complaint counted twice in the L3/L2/L1 driver totals). Keep the value
+ * on the row where it first appears and clear the repeat.
+ */
+function deduplicateRepeatedRowFields(rows: ExtractionRow[]) {
+  const seenRatings = new Set<string>();
+  const seenL3Drivers = new Set<string>();
+
+  return rows.map((row) => {
+    const normalizedRating = normalizeForDuplicateCheck(row.rating || "");
+    const normalizedL3Driver = normalizeForDuplicateCheck(row.l3Driver || "");
+    const next = { ...row };
+
+    if (normalizedRating) {
+      if (seenRatings.has(normalizedRating)) {
+        next.rating = "";
+      } else {
+        seenRatings.add(normalizedRating);
+      }
+    }
+
+    if (normalizedL3Driver) {
+      if (seenL3Drivers.has(normalizedL3Driver)) {
+        next.l3Driver = "";
+      } else {
+        seenL3Drivers.add(normalizedL3Driver);
+      }
+    }
+
+    return next;
+  });
+}
+
 function enrichDriverHierarchy(rows: ExtractionRow[]) {
   return rows.map((row) => ({
     ...row,
@@ -179,6 +225,72 @@ function isRetryableTranscriptionError(error: unknown) {
   }
 
   return false;
+}
+
+function isRetryableExtractionError(error: unknown) {
+  if (error instanceof APIError) {
+    return error.status === 429 || (error.status ?? 0) >= 500;
+  }
+
+  return error instanceof SyntaxError || error instanceof z.ZodError;
+}
+
+function getExtractionChunkCharLimit() {
+  const configuredLimit = Number(process.env.EXTRACTION_CHUNK_CHAR_LIMIT || "");
+
+  if (!Number.isFinite(configuredLimit) || configuredLimit <= 0) {
+    return DEFAULT_EXTRACTION_CHUNK_CHAR_LIMIT;
+  }
+
+  return Math.max(
+    MIN_EXTRACTION_CHUNK_CHAR_LIMIT,
+    Math.floor(configuredLimit)
+  );
+}
+
+function findTranscriptSplitPoint(transcript: string, start: number, limit: number) {
+  const hardEnd = Math.min(start + limit, transcript.length);
+
+  if (hardEnd >= transcript.length) {
+    return transcript.length;
+  }
+
+  const softStart = start + Math.floor(limit * 0.6);
+  const searchWindow = transcript.slice(softStart, hardEnd);
+  const sentenceBreaks = [". ", "? ", "! ", "\n"];
+  let splitOffset = -1;
+
+  for (const breakText of sentenceBreaks) {
+    splitOffset = Math.max(splitOffset, searchWindow.lastIndexOf(breakText));
+  }
+
+  if (splitOffset >= 0) {
+    return softStart + splitOffset + 1;
+  }
+
+  const lastSpace = transcript.lastIndexOf(" ", hardEnd);
+
+  return lastSpace > softStart ? lastSpace : hardEnd;
+}
+
+function splitTranscriptForExtraction(transcript: string) {
+  const normalizedTranscript = transcript.trim();
+  const limit = getExtractionChunkCharLimit();
+  const chunks: string[] = [];
+  let start = 0;
+
+  while (start < normalizedTranscript.length) {
+    const end = findTranscriptSplitPoint(normalizedTranscript, start, limit);
+    const chunk = normalizedTranscript.slice(start, end).trim();
+
+    if (chunk) {
+      chunks.push(chunk);
+    }
+
+    start = end;
+  }
+
+  return chunks.length ? chunks : [normalizedTranscript];
 }
 
 function isPartialTranscription(params: {
@@ -327,12 +439,17 @@ async function transcribeAudioChunk(params: {
 }
 
 async function transcribeWithOpenAIFromBuffer(
-  buffer: Buffer,
-  fileName: string
+  rawBuffer: Buffer,
+  rawFileName: string
 ): Promise<TranscriptionResult> {
-  if (!buffer.byteLength) {
-    throw new Error(`Audio file ${fileName} is empty.`);
+  if (!rawBuffer.byteLength) {
+    throw new Error(`Audio file ${rawFileName} is empty.`);
   }
+
+  const { buffer, name: fileName } = await preprocessAudioBufferForTranscription(
+    rawBuffer,
+    rawFileName
+  );
 
   if (buffer.byteLength <= WHISPER_MAX_FILE_BYTES) {
     return transcribeAudioChunk({
@@ -371,50 +488,91 @@ export async function transcribeAudio(file: File): Promise<TranscriptionResult> 
   return transcribeAudioBuffer(buffer, file.name);
 }
 
-export async function extractRowsFromTranscript(params: {
+async function extractRowsFromTranscriptChunk(params: {
   transcript: string;
+  chunkIndex: number;
+  totalChunks: number;
 }): Promise<ExtractionRow[]> {
   const client = getClient();
   const model = process.env.OPENAI_EXTRACTION_MODEL || "gpt-4.1-mini";
+  const chunkContext =
+    params.totalChunks > 1
+      ? `You are processing transcript part ${params.chunkIndex + 1} of ${params.totalChunks}. Extract only the events present in this part.`
+      : "You are processing the full transcript.";
+  const maxAttempts = 3;
 
-  const completion = await client.chat.completions.create({
-    model,
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content:
-          "You convert customer feedback conversations into normalized spreadsheet rows. Return strict JSON with shape {\"rows\": [...]}. Create one row per conversation event, not one row per broad topic. Events include greeting or introduction, consent to continue, ownership confirmation, recommendation intent, each rating mention, each liked feature, each complaint, each issue detail, each improvement request, each device or version detail, each charger or service comment, each next-step commitment, and closing or thank-you. Do not merge separate events into one row just because they are related. Preserve the same customerName and company across all rows when the transcript makes them clear. Leave unknown values empty. Do not invent contact information. If a numeric or verbal rating is mentioned, capture it in the rating field. For each row, populate notes with a concise summary of the event context, key details, and business meaning. For each row, populate transcription with the exact verbatim spoken words from the transcript for that event. notes and transcription are different fields: notes is an interpreted summary; transcription is the original voice-to-text excerpt. For each row, populate l3Driver only when the customer describes a product, connected feature, vehicle, charger, device, or connectivity problem. Derive l3Driver from the customer's voice as a concise problem statement. Leave l3Driver empty for agent speech, greetings, consent, closings, ratings without a problem, or non-problem events. Derive l2Driver and l1Driver only when l3Driver is populated. For vehicle-related customer problems, set both l2Driver and l1Driver to Vehicle issue. For charger-related customer problems, set both l2Driver and l1Driver to Charger issue. For connected feature experience problems, derive l2Driver as a specific issue label and l1Driver as a broader issue group without using Connected Feature or Connected App as a prefix. For other customer problems, set both l2Driver and l1Driver to Others. If l3Driver is empty, leave l2Driver and l1Driver empty."
-      },
-      {
-        role: "user",
-        content: [
-          "Columns: speaker, timestamp, topic, customerName, company, email, phone, sentiment, transcription, notes, l3Driver, l2Driver, l1Driver, nextStep, rating, actionItems.",
-          "Return detailed event-level rows, including intro and closing moments when they are present in the transcript.",
-          "If the customer name or company appears anywhere in the transcript, copy that same value into every relevant row instead of leaving later rows blank.",
-          "notes must contain a concise summary or key takeaway for the event. Do not leave notes empty when there is event content to summarize.",
-          "transcription must contain the exact voice-to-text words from the transcript for that event. Do not put the summary into transcription.",
-          "l3Driver must be a customer problem statement. Leave l3Driver blank when the customer did not raise a product, connected feature, vehicle, charger, device, or connectivity problem in that event.",
-          "If l3Driver is empty, l2Driver and l1Driver must also be empty.",
-          "For vehicle-related customer problems, set l2Driver to Vehicle issue and l1Driver to Vehicle issue.",
-          "For charger-related customer problems, set l2Driver to Charger issue and l1Driver to Charger issue.",
-          "For connected feature experience problems, derive l2Driver from the specific issue and l1Driver from the broader issue family. Examples: map accuracy or lag -> Navigation Issue; Bluetooth pairing or disconnection -> Bluetooth Connectivity Issue; call/message/alert issues -> Notification Issue; app/cluster/vehicle data sync issues -> Data Sync Issue; login or OTP issues -> Login Issue; live tracking or location issues -> Live Tracking Issue; slow/not working/interface issues -> Performance, Functionality, or Usability Issue.",
-          "For customer problems not related to connected feature, vehicle, or charger, set l2Driver to Others and l1Driver to Others.",
-          "For positive feedback, greetings, agent speech, consent, closing, and rating-only rows, leave l3Driver, l2Driver, and l1Driver empty.",
-          "If timestamps are unavailable, leave them blank.",
-          "Transcript:",
-          params.transcript
-        ].join("\n")
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const completion = await client.chat.completions.create({
+        model,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content:
+              "You convert customer feedback conversations into normalized spreadsheet rows. Return strict JSON with shape {\"rows\": [...]}. Create one row per conversation event, not one row per broad topic. Events include greeting or introduction, consent to continue, ownership confirmation, recommendation intent, each rating mention, each liked feature, each complaint, each issue detail, each improvement request, each device or version detail, each charger or service comment, each next-step commitment, and closing or thank-you. Do not merge separate events into one row just because they are related. Preserve the same customerName and company across all rows when the transcript makes them clear. Leave unknown values empty. Do not invent contact information. If a numeric or verbal rating is mentioned, capture it in the rating field. For each row, populate notes with a concise summary of the event context, key details, and business meaning. For each row, populate transcription with the exact verbatim spoken words from the transcript for that event. notes and transcription are different fields: notes is an interpreted summary; transcription is the original voice-to-text excerpt. For each row, populate l3Driver only when the customer describes a product, connected feature, vehicle, charger, device, or connectivity problem. Derive l3Driver from the customer's voice as a concise problem statement. Leave l3Driver empty for agent speech, greetings, consent, closings, ratings without a problem, or non-problem events. Derive l2Driver and l1Driver only when l3Driver is populated. For vehicle-related customer problems, set both l2Driver and l1Driver to Vehicle issue. For charger-related customer problems, set both l2Driver and l1Driver to Charger issue. For connected feature experience problems, derive l2Driver as a specific issue label and l1Driver as a broader issue group without using Connected Feature or Connected App as a prefix. For other customer problems, set both l2Driver and l1Driver to Others. If l3Driver is empty, leave l2Driver and l1Driver empty."
+          },
+          {
+            role: "user",
+            content: [
+              chunkContext,
+              "Columns: speaker, timestamp, topic, customerName, company, email, phone, sentiment, transcription, notes, l3Driver, l2Driver, l1Driver, nextStep, rating, actionItems.",
+              "Return detailed event-level rows, including intro and closing moments when they are present in the transcript.",
+              "If the customer name or company appears anywhere in the transcript, copy that same value into every relevant row instead of leaving later rows blank.",
+              "notes must contain a concise summary or key takeaway for the event. Do not leave notes empty when there is event content to summarize.",
+              "transcription must contain the exact voice-to-text words from the transcript for that event. Do not put the summary into transcription.",
+              "l3Driver must be a customer problem statement. Leave l3Driver blank when the customer did not raise a product, connected feature, vehicle, charger, device, or connectivity problem in that event.",
+              "If l3Driver is empty, l2Driver and l1Driver must also be empty.",
+              "For vehicle-related customer problems, set l2Driver to Vehicle issue and l1Driver to Vehicle issue.",
+              "For charger-related customer problems, set l2Driver to Charger issue and l1Driver to Charger issue.",
+              "For connected feature experience problems, derive l2Driver from the specific issue and l1Driver from the broader issue family. Examples: map accuracy or lag -> Navigation Issue; Bluetooth pairing or disconnection -> Bluetooth Connectivity Issue; call/message/alert issues -> Notification Issue; app/cluster/vehicle data sync issues -> Data Sync Issue; login or OTP issues -> Login Issue; live tracking or location issues -> Live Tracking Issue; slow/not working/interface issues -> Performance, Functionality, or Usability Issue.",
+              "For customer problems not related to connected feature, vehicle, or charger, set l2Driver to Others and l1Driver to Others.",
+              "For positive feedback, greetings, agent speech, consent, closing, and rating-only rows, leave l3Driver, l2Driver, and l1Driver empty.",
+              "If timestamps are unavailable, leave them blank.",
+              "Transcript:",
+              params.transcript
+            ].join("\n")
+          }
+        ]
+      });
+
+      const raw = completion.choices[0]?.message?.content;
+
+      if (!raw) {
+        throw new Error("The extraction model returned an empty response.");
       }
-    ]
-  });
 
-  const raw = completion.choices[0]?.message?.content;
+      const parsed = extractionSchema.parse(JSON.parse(raw));
+      return parsed.rows;
+    } catch (error) {
+      if (!isRetryableExtractionError(error) || attempt === maxAttempts) {
+        throw error;
+      }
 
-  if (!raw) {
-    throw new Error("The extraction model returned an empty response.");
+      await sleep(attempt * 2500);
+    }
   }
 
-  const parsed = extractionSchema.parse(JSON.parse(raw));
-  return enrichDriverHierarchy(preserveSharedConversationFields(parsed.rows));
+  return [];
+}
+
+export async function extractRowsFromTranscript(params: {
+  transcript: string;
+}): Promise<ExtractionRow[]> {
+  const transcriptChunks = splitTranscriptForExtraction(params.transcript);
+  const rows: ExtractionRow[] = [];
+
+  for (const [chunkIndex, transcriptChunk] of transcriptChunks.entries()) {
+    rows.push(
+      ...(await extractRowsFromTranscriptChunk({
+        transcript: transcriptChunk,
+        chunkIndex,
+        totalChunks: transcriptChunks.length
+      }))
+    );
+  }
+
+  return enrichDriverHierarchy(
+    deduplicateRepeatedRowFields(preserveSharedConversationFields(rows))
+  );
 }

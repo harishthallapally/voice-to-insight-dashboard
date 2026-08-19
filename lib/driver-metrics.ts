@@ -11,12 +11,21 @@ export type DateCount = {
   count: number;
 };
 
+export type NpsMetrics = {
+  score: number | null;
+  promoters: number;
+  passives: number;
+  detractors: number;
+  totalResponses: number;
+};
+
 export type DriverMetrics = {
   detractorCount: number;
   l3Drivers: DriverCount[];
   l2Drivers: DriverCount[];
   l1Drivers: DriverCount[];
   vehicleVariants: DriverCount[];
+  connectedFeaturesNps: NpsMetrics;
 };
 
 type VehicleVariantMatcher = {
@@ -155,6 +164,96 @@ function parseRating(value: string) {
   return null;
 }
 
+export function calculateNpsScore(params: {
+  promoters: number;
+  detractors: number;
+  totalResponses: number;
+}) {
+  if (params.totalResponses <= 0) {
+    return null;
+  }
+
+  return Math.round(
+    ((params.promoters - params.detractors) / params.totalResponses) * 100
+  );
+}
+
+function isConnectedFeaturesRating(row: ExtractionRow) {
+  const rowContext = [
+    row.topic,
+    row.notes,
+    row.l3Driver,
+    row.transcription
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  return /\b(connected|connectivity|mobile app|mobile application|app|maps?|bluetooth|navigation|gps|phone|pairing|telematics|smartxconnect|smart xonnect)\b/.test(
+    rowContext
+  );
+}
+
+function getConnectedFeaturesRatingRow(rows: ExtractionRow[]) {
+  const candidates = rows.filter((row) => {
+    if (!isConnectedFeaturesRating(row)) {
+      return false;
+    }
+
+    const rating = parseRating(row.rating);
+
+    return rating !== null && rating >= 0 && rating <= 10;
+  });
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  // Prefer the customer's own row: extraction occasionally repeats the
+  // rating value onto the agent's follow-up "why did you rate it X" row.
+  return (
+    candidates.find((row) => row.speaker.trim().toLowerCase() === "customer") ??
+    candidates[0]
+  );
+}
+
+function buildConnectedFeaturesNps(rows: ExtractionRow[]): NpsMetrics {
+  const npsMetrics: NpsMetrics = {
+    score: null,
+    promoters: 0,
+    passives: 0,
+    detractors: 0,
+    totalResponses: 0
+  };
+
+  // Every row here comes from a single audio file, i.e. a single customer
+  // call, so at most one rating should ever count toward NPS. Extraction
+  // sometimes carries the same rating value onto more than one row (e.g. the
+  // customer's answer and the agent's follow-up asking for reasons) — only
+  // the customer's own rating statement should be counted, and only once.
+  const ratedRow = getConnectedFeaturesRatingRow(rows);
+
+  if (!ratedRow) {
+    return npsMetrics;
+  }
+
+  const rating = parseRating(ratedRow.rating) as number;
+
+  npsMetrics.totalResponses = 1;
+
+  if (rating >= 9) {
+    npsMetrics.promoters = 1;
+  } else if (rating >= 7) {
+    npsMetrics.passives = 1;
+  } else {
+    npsMetrics.detractors = 1;
+  }
+
+  npsMetrics.score = calculateNpsScore(npsMetrics);
+
+  return npsMetrics;
+}
+
 function getDetractorCount(rows: ExtractionRow[]) {
   const hasDetractorRating = rows.some((row) => {
     const rating = parseRating(row.rating);
@@ -203,6 +302,7 @@ export function buildDriverMetrics(rows: ExtractionRow[]): DriverMetrics {
     l3Drivers: toSortedDriverCounts(l3Counts),
     l2Drivers: toSortedDriverCounts(l2Counts),
     l1Drivers: toSortedDriverCounts(l1Counts),
-    vehicleVariants: getVehicleVariants(rows)
+    vehicleVariants: getVehicleVariants(rows),
+    connectedFeaturesNps: buildConnectedFeaturesNps(rows)
   };
 }
