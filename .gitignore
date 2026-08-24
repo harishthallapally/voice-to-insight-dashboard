@@ -166,3 +166,6 @@ artifacts/
 outputs/
 scripts/
 work/presentations/
+
+# Local stand-in for OneDrive during demos
+demo-drive/
