@@ -14,7 +14,6 @@ import {
 import { resolveDriverHierarchy } from "@/lib/driver-taxonomy";
 import type { DriverMetrics } from "@/lib/driver-metrics";
 import type { ExtractionRow } from "@/lib/types";
-import { runTranscriptionTask } from "@/lib/transcription-queue";
 
 const { APIError } = OpenAI;
 const DEFAULT_EXTRACTION_CHUNK_CHAR_LIMIT = 12000;
@@ -624,9 +623,16 @@ export async function transcribeAudioBuffer(
   buffer: Buffer,
   fileName: string
 ): Promise<TranscriptionResult> {
-  return runTranscriptionTask(() =>
-    transcribeWithOpenAIFromBuffer(buffer, fileName)
-  );
+  // Concurrency across files is governed by the job queue's
+  // TRANSCRIPTION_WORKER_CONCURRENCY (lib/audio-job-queue.ts) — this used to
+  // also funnel through a global one-at-a-time promise chain
+  // (lib/transcription-queue.ts), which meant every file's transcription
+  // ran strictly sequentially server-wide no matter how many jobs the queue
+  // marked "active". Preprocessing uses per-call mkdtemp temp dirs
+  // (lib/audio-chunking.ts), so there's no shared state that needs
+  // serializing here; the retry/backoff hardening in transcribeAudioChunk
+  // absorbs the rate-limit fallout that extra queue was guarding against.
+  return transcribeWithOpenAIFromBuffer(buffer, fileName);
 }
 
 export async function transcribeAudio(file: File): Promise<TranscriptionResult> {
