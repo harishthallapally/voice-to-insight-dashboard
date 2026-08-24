@@ -1,55 +1,132 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+
+import {
+  formatMonthKey,
+  type FuelType,
+  type ParsedWorkbook
+} from "@/lib/nps-excel";
+import {
+  buildDashboardModel,
+  DEFAULT_FILTERS,
+  type DashboardModel,
+  type FyBar,
+  type MonthPoint,
+  type NpsFilters,
+  type SamplePoint
+} from "@/lib/nps-metrics";
+
+import {
+  clearWorkbooks,
+  loadWorkbooks,
+  saveWorkbooks
+} from "@/lib/nps-storage";
+
+import {
+  ConnectedNpsUpload,
+  type UploadError
+} from "./connected-nps-upload";
 import styles from "./connected-nps-dashboard.module.css";
 
-// This is a standalone, read-only replica of the "Connected NPS" report
-// built with static demo data. It does not read from or write to any of
-// the existing dashboard/upload code paths in this project.
+// A replica of the "Connected NPS" report. Until workbooks are uploaded it
+// renders the static demo figures it shipped with; once the Excel files are
+// loaded every figure below is computed from them.
 
-const FILTERS: Array<{ label: string; value: string }> = [
-  { label: "Month", value: "01-06-2026" },
-  { label: "Age", value: "All" },
-  { label: "Category", value: "All" },
-  { label: "Subcategory", value: "All" },
-  { label: "Variant", value: "All" }
-];
-
-const YEAR_BARS = [
-  { label: "23-24", value: null as number | null },
-  { label: "24-25", value: null as number | null },
-  { label: "25-26", value: 40.6 }
-];
-
-const CURRENT_YEAR_MONTHS = ["Apr", "May", "Jun", "Jul", "Aug"];
-const CURRENT_YEAR_VALUES = [45.6, 42.9, 53.4, 54.0, 56.3];
-const REMAINING_MONTHS = ["Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar"];
-const COMPARISON_MONTHLY = [38.2, 41.5, 39.8, 43.6, 49.1, 45.3, 42.4, 46.0, 47.8, 50.6, 47.2, 43.9];
-const YTD_VALUE = 50.4;
-const CURRENT_MONTH_SAMPLE = 460;
 const RESPONSIBLE = "S Manickaraj (SM)";
 
-const WEEKS = ["21-Jun", "28-Jun", "05-Jul", "12-Jul", "19-Jul", "26-Jul", "02-Aug", "09-Aug"];
-const WEEK_ACTUALS = [52.2, 50.6, 56.7, 55.7, 53.9, 40.0, 60.1, 39.5];
-const WEEK_TARGETS = [0, 0, 0, 0, 0, 0, 0, 0];
-
-type SampleMonth = {
-  label: string;
-  dialed: number;
-  closeCall: number;
-  respondents: number;
-  respondentPct: number;
-};
-
-const SAMPLE_TREND: SampleMonth[] = [
-  { label: "Mar-26", dialed: 846, closeCall: 620, respondents: 422, respondentPct: 50 },
-  { label: "Apr-26", dialed: 1582, closeCall: 1522, respondents: 1145, respondentPct: 75 },
-  { label: "May-26", dialed: 1674, closeCall: 1610, respondents: 1274, respondentPct: 76 },
-  { label: "Jun-26", dialed: 993, closeCall: 860, respondents: 639, respondentPct: 64 },
-  { label: "Jul-26", dialed: 841, closeCall: 730, respondents: 526, respondentPct: 63 },
-  { label: "Aug-26", dialed: 578, closeCall: 547, respondents: 460, respondentPct: 84 }
+const DEMO_MONTH_LABELS = [
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+  "Jan",
+  "Feb",
+  "Mar"
 ];
 
-const VARIANCE_VALUE = 639;
+const DEMO_CURRENT = [45.6, 42.9, 53.4, 54.0, 56.3, null, null, null, null, null, null, null];
+const DEMO_PREVIOUS = [38.2, 41.5, 39.8, 43.6, 49.1, 45.3, 42.4, 46.0, 47.8, 50.6, 47.2, 43.9];
 
-function NpsComboChart() {
+function toDemoMonths(values: Array<number | null>): MonthPoint[] {
+  return values.map((value, index) => ({
+    month: `demo-${index}`,
+    label: DEMO_MONTH_LABELS[index],
+    nps: value,
+    total: 0
+  }));
+}
+
+/** The figures the page shipped with, shaped like a parsed model. */
+const DEMO_MODEL: DashboardModel = {
+  hasData: false,
+  fiscalYear: 2026,
+  fiscalYearLabel: "26-27",
+  fyBars: [
+    { label: "23-24", nps: null },
+    { label: "24-25", nps: null },
+    { label: "25-26", nps: 40.6 }
+  ],
+  currentMonths: toDemoMonths(DEMO_CURRENT),
+  previousMonths: toDemoMonths(DEMO_PREVIOUS),
+  ytd: 50.4,
+  currentMonthSample: 460,
+  currentMonthLabel: "Aug-26",
+  selectedMonthSample: 639,
+  selectedMonthLabel: "Jun-26",
+  sampleTrend: [
+    { month: "d1", label: "Mar-26", respondents: 422, dialed: 846, closeCall: 846, respondentPct: 50, usage: null },
+    { month: "d2", label: "Apr-26", respondents: 1145, dialed: 1582, closeCall: 1522, respondentPct: 75, usage: null },
+    { month: "d3", label: "May-26", respondents: 1274, dialed: 1674, closeCall: 1674, respondentPct: 76, usage: null },
+    { month: "d4", label: "Jun-26", respondents: 639, dialed: 993, closeCall: 993, respondentPct: 64, usage: null },
+    { month: "d5", label: "Jul-26", respondents: 526, dialed: 841, closeCall: 841, respondentPct: 63, usage: null },
+    { month: "d6", label: "Aug-26", respondents: 548, dialed: 730, closeCall: 699, respondentPct: 78, usage: null }
+  ],
+  weeks: [
+    { label: "21-Jun", nps: 52.2, total: 0 },
+    { label: "28-Jun", nps: 50.6, total: 0 },
+    { label: "05-Jul", nps: 56.7, total: 0 },
+    { label: "12-Jul", nps: 55.7, total: 0 },
+    { label: "19-Jul", nps: 53.9, total: 0 },
+    { label: "26-Jul", nps: 40.0, total: 0 },
+    { label: "02-Aug", nps: 60.1, total: 0 },
+    { label: "09-Aug", nps: 51.6, total: 0 }
+  ],
+  monthOptions: [],
+  subcategoryOptions: [],
+  variantOptions: [],
+  dialedAvailable: true,
+  usageAvailable: false,
+  weeksFromDailyRows: true,
+  warnings: []
+};
+
+/**
+ * Builds a symmetric-ish axis in steps of 16 so the gridlines keep the look of
+ * the source report while still fitting negative NPS values, which appear once
+ * a single low-scoring variant is selected.
+ */
+function buildScale(values: Array<number | null>) {
+  const present = values.filter((value): value is number => value !== null);
+  const max = present.length > 0 ? Math.max(...present) : 0;
+  const min = present.length > 0 ? Math.min(...present) : 0;
+
+  const step = 16;
+  const upper = Math.max(step, Math.ceil(max / step) * step);
+  const lower = min < 0 ? Math.floor(min / step) * step : 0;
+
+  const ticks: number[] = [];
+  for (let tick = upper; tick >= lower; tick -= step) ticks.push(tick);
+
+  return { upper, lower, ticks };
+}
+
+function NpsComboChart({ model }: { model: DashboardModel }) {
   const width = 760;
   const height = 300;
   const left = 46;
@@ -58,29 +135,46 @@ function NpsComboChart() {
   const bottom = 46;
   const plotWidth = width - left - right;
   const plotHeight = height - top - bottom;
-  const upperBound = 64;
-  const ticks = [64, 48, 32, 16, 0];
+
+  const { upper, lower, ticks } = buildScale([
+    ...model.fyBars.map((bar) => bar.nps),
+    ...model.currentMonths.map((point) => point.nps),
+    ...model.previousMonths.map((point) => point.nps),
+    model.ytd
+  ]);
 
   const categories = [
-    ...YEAR_BARS.map((bar) => bar.label),
-    ...CURRENT_YEAR_MONTHS,
-    ...REMAINING_MONTHS,
+    ...model.fyBars.map((bar) => bar.label),
+    ...model.currentMonths.map((point) => point.label),
     "YTD"
   ];
   const slot = plotWidth / categories.length;
   const getX = (index: number) => left + slot * index + slot / 2;
-  const getY = (value: number) =>
-    top + (1 - Math.min(value, upperBound) / upperBound) * plotHeight;
+  const getY = (value: number) => {
+    const clamped = Math.min(Math.max(value, lower), upper);
+    return top + (1 - (clamped - lower) / (upper - lower)) * plotHeight;
+  };
+  const baselineY = getY(0);
 
-  const monthlyStartIndex = YEAR_BARS.length;
-  const monthlyPoints = CURRENT_YEAR_VALUES.map(
-    (value, index) => `${getX(monthlyStartIndex + index)},${getY(value)}`
-  ).join(" ");
+  const monthlyStartIndex = model.fyBars.length;
 
-  const comparisonMonths = [...CURRENT_YEAR_MONTHS, ...REMAINING_MONTHS];
-  const comparisonPoints = COMPARISON_MONTHLY.map(
-    (value, index) => `${getX(monthlyStartIndex + index)},${getY(value)}`
-  ).join(" ");
+  /** Draws each unbroken run of points, so gaps in the data break the line. */
+  const buildSegments = (points: MonthPoint[]) => {
+    const segments: string[][] = [];
+    let current: string[] = [];
+
+    points.forEach((point, index) => {
+      if (point.nps === null) {
+        if (current.length > 1) segments.push(current);
+        current = [];
+        return;
+      }
+      current.push(`${getX(monthlyStartIndex + index)},${getY(point.nps)}`);
+    });
+    if (current.length > 1) segments.push(current);
+
+    return segments.map((segment) => segment.join(" "));
+  };
 
   const ytdIndex = categories.length - 1;
 
@@ -93,7 +187,6 @@ function NpsComboChart() {
     >
       {ticks.map((tick) => {
         const y = getY(tick);
-
         return (
           <g key={tick}>
             <line
@@ -113,22 +206,22 @@ function NpsComboChart() {
       <line
         x1={left}
         x2={width - right}
-        y1={height - bottom}
-        y2={height - bottom}
+        y1={baselineY}
+        y2={baselineY}
         stroke="#334155"
         strokeWidth={1.4}
       />
 
-      {YEAR_BARS.map((bar, index) => {
+      {model.fyBars.map((bar: FyBar, index) => {
         const x = getX(index);
         const barWidth = slot * 0.55;
 
-        if (bar.value === null) {
+        if (bar.nps === null) {
           return (
             <text
               key={bar.label}
               x={x}
-              y={height - bottom - 6}
+              y={baselineY - 6}
               fontSize={11}
               fill="#94a3b8"
               textAnchor="middle"
@@ -138,13 +231,15 @@ function NpsComboChart() {
           );
         }
 
-        const barHeight = plotHeight * (bar.value / upperBound);
+        const valueY = getY(bar.nps);
+        const barTop = Math.min(valueY, baselineY);
+        const barHeight = Math.abs(baselineY - valueY);
 
         return (
           <g key={bar.label}>
             <rect
               x={x - barWidth / 2}
-              y={height - bottom - barHeight}
+              y={barTop}
               width={barWidth}
               height={barHeight}
               fill="#ffffff"
@@ -153,52 +248,73 @@ function NpsComboChart() {
             />
             <text
               x={x}
-              y={height - bottom - barHeight - 8}
+              y={barTop - 8}
               fontSize={12}
               fontWeight={700}
               fill="#1f2937"
               textAnchor="middle"
             >
-              {bar.value.toFixed(1)}
+              {bar.nps.toFixed(1)}
             </text>
           </g>
         );
       })}
 
-      <polyline points={comparisonPoints} fill="none" stroke="#c3c9d4" strokeWidth={1.6} />
-      <polyline points={monthlyPoints} fill="none" stroke="#1f9d55" strokeWidth={2.4} />
+      {buildSegments(model.previousMonths).map((points, index) => (
+        <polyline
+          key={`prev-${index}`}
+          points={points}
+          fill="none"
+          stroke="#c3c9d4"
+          strokeWidth={1.6}
+        />
+      ))}
+      {buildSegments(model.currentMonths).map((points, index) => (
+        <polyline
+          key={`curr-${index}`}
+          points={points}
+          fill="none"
+          stroke="#1f9d55"
+          strokeWidth={2.4}
+        />
+      ))}
 
-      {CURRENT_YEAR_VALUES.map((value, index) => {
+      {model.currentMonths.map((point, index) => {
+        if (point.nps === null) return null;
         const x = getX(monthlyStartIndex + index);
-        const y = getY(value);
+        const y = getY(point.nps);
 
         return (
-          <g key={CURRENT_YEAR_MONTHS[index]}>
+          <g key={`point-${point.month}`}>
             <circle cx={x} cy={y} r={3.2} fill="#1f9d55" stroke="#ffffff" strokeWidth={1.4} />
             <text x={x} y={y - 10} fontSize={11} fontWeight={700} fill="#1f9d55" textAnchor="middle">
-              {value.toFixed(1)}
+              {point.nps.toFixed(1)}
             </text>
           </g>
         );
       })}
 
-      <rect
-        x={getX(ytdIndex) - slot * 0.28}
-        y={getY(YTD_VALUE)}
-        width={slot * 0.56}
-        height={height - bottom - getY(YTD_VALUE)}
-        fill="#1f9d55"
-      />
-      <text
-        x={getX(ytdIndex)}
-        y={getY(YTD_VALUE) - 8}
-        fontSize={12}
-        fontWeight={700}
-        fill="#1f9d55"
-        textAnchor="middle"
-      >
-        {YTD_VALUE.toFixed(1)}
-      </text>
+      {model.ytd !== null ? (
+        <>
+          <rect
+            x={getX(ytdIndex) - slot * 0.28}
+            y={Math.min(getY(model.ytd), baselineY)}
+            width={slot * 0.56}
+            height={Math.abs(baselineY - getY(model.ytd))}
+            fill="#1f9d55"
+          />
+          <text
+            x={getX(ytdIndex)}
+            y={Math.min(getY(model.ytd), baselineY) - 8}
+            fontSize={12}
+            fontWeight={700}
+            fill="#1f9d55"
+            textAnchor="middle"
+          >
+            {model.ytd.toFixed(1)}
+          </text>
+        </>
+      ) : null}
 
       {categories.map((label, index) => (
         <text
@@ -216,7 +332,7 @@ function NpsComboChart() {
   );
 }
 
-function SampleTrendChart() {
+function SampleTrendChart({ points }: { points: SamplePoint[] }) {
   const width = 560;
   const height = 280;
   const left = 40;
@@ -225,18 +341,84 @@ function SampleTrendChart() {
   const bottom = 34;
   const plotWidth = width - left - right;
   const plotHeight = height - top - bottom;
-  const maxCount = Math.max(1, ...SAMPLE_TREND.map((month) => month.dialed));
-  const slot = plotWidth / SAMPLE_TREND.length;
+
+  if (points.length === 0) {
+    return <p className={styles.emptyNote}>No sample data for this selection.</p>;
+  }
+
+  // With the NPS Dashboard Raw tab loaded the trend shows total customers
+  // against those using the connected-features app, plus the share as a line;
+  // otherwise it falls back to the response counts.
+  const hasUsage = points.some(
+    (point) => point.usage && point.usage.using + point.usage.notUsing > 0
+  );
+
+  // Only rows where the connected-features question was actually answered
+  // count. Rows left as "-" or blank are unreached customers, not a "no".
+  const totalOf = (point: SamplePoint) =>
+    point.usage ? point.usage.using + point.usage.notUsing : 0;
+
+  /** Share of answering customers who are using the app. */
+  const pctOf = (point: SamplePoint) => {
+    if (!point.usage) return null;
+    const total = totalOf(point);
+    return total > 0 ? (point.usage.using / total) * 100 : null;
+  };
+
+  const maxCount = Math.max(
+    1,
+    ...points.flatMap((point) =>
+      hasUsage
+        ? [totalOf(point), point.usage?.using ?? 0]
+        : [point.dialed ?? 0, point.closeCall ?? 0, point.respondents]
+    )
+  );
+  const slot = plotWidth / points.length;
+
+  // Only render the series the workbooks actually carry, so the bars stay
+  // honest when dialed / close-call counts are absent.
+  const hasDialed = !hasUsage && points.some((point) => point.dialed !== null);
+  const hasCloseCall =
+    !hasUsage && points.some((point) => point.closeCall !== null);
+  const seriesCount = hasUsage
+    ? 2
+    : 1 + (hasDialed ? 1 : 0) + (hasCloseCall ? 1 : 0);
+
   const barGroupWidth = slot * 0.68;
-  const barWidth = barGroupWidth / 3;
+  const barWidth = barGroupWidth / seriesCount;
 
   const getBarHeight = (value: number) => (value / maxCount) * plotHeight;
-  const getPctY = (pct: number) => top + (1 - pct / 100) * plotHeight;
 
-  const pctPoints = SAMPLE_TREND.map((month, index) => {
-    const x = left + slot * index + slot / 2;
-    return `${x},${getPctY(month.respondentPct)}`;
-  }).join(" ");
+  // Adoption sits near 10%, so a fixed 0-100 axis would flatten the line
+  // against the baseline. Scale it to the data instead, rounded up to a step.
+  const percentValues = points
+    .map((point) => (hasUsage ? pctOf(point) : point.respondentPct))
+    .filter((value): value is number => value !== null);
+  const maxPercent = percentValues.length > 0 ? Math.max(...percentValues) : 100;
+  // Extra headroom keeps the percent line below the tops of the tall Total
+  // Customers bars, so its labels do not sit on top of the bar values.
+  const percentBound = hasUsage
+    ? Math.max(5, Math.ceil((maxPercent * 1.45) / 5) * 5)
+    : 100;
+
+  const getPctY = (pct: number) =>
+    top + (1 - pct / percentBound) * plotHeight;
+
+  const percentAt = (point: SamplePoint) =>
+    hasUsage ? pctOf(point) : point.respondentPct;
+
+  const pctSegments: string[] = [];
+  let run: string[] = [];
+  points.forEach((point, index) => {
+    const value = percentAt(point);
+    if (value === null) {
+      if (run.length > 1) pctSegments.push(run.join(" "));
+      run = [];
+      return;
+    }
+    run.push(`${left + slot * index + slot / 2},${getPctY(value)}`);
+  });
+  if (run.length > 1) pctSegments.push(run.join(" "));
 
   return (
     <svg
@@ -254,37 +436,73 @@ function SampleTrendChart() {
         strokeWidth={1.2}
       />
 
-      {SAMPLE_TREND.map((month, index) => {
+      {points.map((point, index) => {
         const groupX = left + slot * index + (slot - barGroupWidth) / 2;
-        const bars: Array<{ value: number; color: string; offset: number }> = [
-          { value: month.dialed, color: "#4f8ef0", offset: 0 },
-          { value: month.closeCall, color: "#9a6fd1", offset: 1 },
-          { value: month.respondents, color: "#f5a25d", offset: 2 }
-        ];
+        const bars: Array<{ value: number; color: string }> = [];
+
+        if (hasUsage) {
+          // A month the Raw tab does not cover - or one where nobody answered
+          // the question - has no bars at all. Drawing zeroes would read as
+          // "nobody uses the features" rather than "no data for this month".
+          if (!point.usage || totalOf(point) === 0) {
+            return (
+              <g key={point.month}>
+                <text
+                  x={left + slot * index + slot / 2}
+                  y={height - bottom - 6}
+                  fontSize={9}
+                  fill="#cbd5e1"
+                  textAnchor="middle"
+                >
+                  no data
+                </text>
+                <text
+                  x={left + slot * index + slot / 2}
+                  y={height - bottom + 16}
+                  fontSize={10.5}
+                  fill="#5a6b82"
+                  textAnchor="middle"
+                >
+                  {point.label}
+                </text>
+              </g>
+            );
+          }
+
+          bars.push(
+            { value: totalOf(point), color: "#4f8ef0" },
+            { value: point.usage.using, color: "#1f9d55" }
+          );
+        } else {
+          if (hasDialed) bars.push({ value: point.dialed ?? 0, color: "#4f8ef0" });
+          if (hasCloseCall)
+            bars.push({ value: point.closeCall ?? 0, color: "#9a6fd1" });
+          bars.push({ value: point.respondents, color: "#f5a25d" });
+        }
 
         return (
-          <g key={month.label}>
-            {bars.map((bar) => {
+          <g key={point.month}>
+            {bars.map((bar, barIndex) => {
               const barHeight = getBarHeight(bar.value);
-              const x = groupX + bar.offset * barWidth;
+              const x = groupX + barIndex * barWidth;
 
               return (
                 <g key={bar.color}>
                   <rect
                     x={x}
                     y={height - bottom - barHeight}
-                    width={barWidth - 3}
+                    width={Math.max(2, barWidth - 3)}
                     height={barHeight}
                     fill={bar.color}
                   />
                   <text
-                    x={x + (barWidth - 3) / 2}
+                    x={x + Math.max(2, barWidth - 3) / 2}
                     y={height - bottom - barHeight - 4}
                     fontSize={9}
                     fill="#334155"
                     textAnchor="middle"
                   >
-                    {bar.value}
+                    {bar.value.toLocaleString()}
                   </text>
                 </g>
               );
@@ -296,31 +514,35 @@ function SampleTrendChart() {
               fill="#5a6b82"
               textAnchor="middle"
             >
-              {month.label}
+              {point.label}
             </text>
           </g>
         );
       })}
 
-      <polyline points={pctPoints} fill="none" stroke="#f2b705" strokeWidth={2.2} />
-      {SAMPLE_TREND.map((month, index) => {
+      {pctSegments.map((segment, index) => (
+        <polyline
+          key={`pct-line-${index}`}
+          points={segment}
+          fill="none"
+          stroke="#f2b705"
+          strokeWidth={2.2}
+        />
+      ))}
+      {points.map((point, index) => {
+        const value = percentAt(point);
+        if (value === null) return null;
         const x = left + slot * index + slot / 2;
-        const y = getPctY(month.respondentPct);
+        const y = getPctY(value);
+        // Adoption percentages need a decimal to be distinguishable.
+        const label = hasUsage ? value.toFixed(1) : String(Math.round(value));
 
         return (
-          <g key={`pct-${month.label}`}>
+          <g key={`pct-${point.month}`}>
             <circle cx={x} cy={y} r={3} fill="#f2b705" stroke="#ffffff" strokeWidth={1} />
-            <rect
-              x={x - 15}
-              y={y - 20}
-              width={30}
-              height={14}
-              rx={3}
-              fill="#f2b705"
-              opacity={0.9}
-            />
+            <rect x={x - 17} y={y - 20} width={34} height={14} rx={3} fill="#f2b705" opacity={0.9} />
             <text x={x} y={y - 10} fontSize={9.5} fontWeight={700} fill="#3a2c00" textAnchor="middle">
-              {month.respondentPct}%
+              {label}%
             </text>
           </g>
         );
@@ -329,71 +551,235 @@ function SampleTrendChart() {
   );
 }
 
-function VarianceChart() {
-  const width = 320;
-  const height = 240;
-  const left = 30;
-  const right = 20;
-  const top = 30;
-  const bottom = 26;
-  const plotHeight = height - top - bottom;
-  const maxValue = VARIANCE_VALUE * 1.1;
-  const barHeight = (VARIANCE_VALUE / maxValue) * plotHeight;
-  const barWidth = 90;
-  const x = width / 2 - barWidth / 2;
+type FilterSelectProps = {
+  label: string;
+  value: string;
+  options: Array<{ value: string; label: string }>;
+  onChange: (value: string) => void;
+  disabled?: boolean;
+};
 
+function FilterSelect({
+  label,
+  value,
+  options,
+  onChange,
+  disabled
+}: FilterSelectProps) {
   return (
-    <svg
-      className={styles.chartSvg}
-      viewBox={`0 0 ${width} ${height}`}
-      role="img"
-      aria-label="Connected rating variance"
-    >
-      <line
-        x1={left}
-        x2={width - right}
-        y1={height - bottom}
-        y2={height - bottom}
-        stroke="#334155"
-        strokeWidth={1.2}
-      />
-      <text x={width / 2} y={top - 8} fontSize={12} fontWeight={700} fill="#1f2937" textAnchor="middle">
-        {VARIANCE_VALUE}
-      </text>
-      <rect
-        x={x}
-        y={height - bottom - barHeight}
-        width={barWidth}
-        height={barHeight}
-        fill="#4f8ef0"
-      />
-    </svg>
+    <div className={styles.filterField}>
+      <span className={styles.filterLabel}>{label}</span>
+      <div className={styles.filterValue}>
+        <select
+          className={styles.filterSelect}
+          value={value}
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.value)}
+          aria-label={label}
+        >
+          {options.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </div>
+    </div>
   );
 }
 
-export function ConnectedNpsDashboard() {
+type DashboardProps = {
+  /**
+   * Restricts the whole page to one fuel type. When set, the Category filter
+   * is fixed and any workbook for the other fuel is ignored, so an ICE page
+   * cannot silently blend EV numbers into its totals.
+   */
+  fuel?: FuelType;
+  title?: string;
+};
+
+export function ConnectedNpsDashboard({ fuel, title }: DashboardProps = {}) {
+  const initialFilters: NpsFilters = fuel
+    ? { ...DEFAULT_FILTERS, fuel }
+    : DEFAULT_FILTERS;
+
+  const [workbooks, setWorkbooks] = useState<ParsedWorkbook[]>([]);
+  const [errors, setErrors] = useState<UploadError[]>([]);
+  const [filters, setFilters] = useState<NpsFilters>(initialFilters);
+  const [storageNotice, setStorageNotice] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<string | null>(null);
+
+  // Restore after mount rather than during render: localStorage is unavailable
+  // on the server, and reading it in render would break hydration.
+  useEffect(() => {
+    const restored = loadWorkbooks();
+    if (restored.workbooks.length > 0) {
+      setWorkbooks(restored.workbooks);
+      setSavedAt(restored.savedAt);
+    }
+    if (restored.notice) setStorageNotice(restored.notice);
+  }, []);
+
+  // A fuel-scoped page only ever sees its own workbooks.
+  const scopedWorkbooks = useMemo(
+    () =>
+      fuel ? workbooks.filter((workbook) => workbook.fuel === fuel) : workbooks,
+    [workbooks, fuel]
+  );
+
+  const liveModel = useMemo(
+    () => buildDashboardModel(scopedWorkbooks, filters),
+    [scopedWorkbooks, filters]
+  );
+
+  // Once workbooks are loaded the live model always wins, even when a filter
+  // combination matches nothing - falling back to the demo figures there would
+  // silently present invented numbers as real ones.
+  const isLive = scopedWorkbooks.length > 0;
+  const model = isLive ? liveModel : DEMO_MODEL;
+
+  const setFilter = <K extends keyof NpsFilters>(key: K, value: NpsFilters[K]) =>
+    setFilters((previous) => ({ ...previous, [key]: value }));
+
+  const allOption = { value: "All", label: "All" };
+
   return (
     <div className={styles.page}>
       <div className={styles.main}>
         <header className={styles.topbar}>
-          <h1 className={styles.pageTitle}>Connected NPS</h1>
+          <h1 className={styles.pageTitle}>{title ?? "Connected NPS"}</h1>
         </header>
         <div className={styles.accentBar} />
 
+        <ConnectedNpsUpload
+          workbooks={workbooks}
+          errors={errors}
+          savedAt={savedAt}
+          storageNotice={storageNotice}
+          onLoaded={(parsed, failures) => {
+            // Re-uploading a file replaces the previous copy of it.
+            setWorkbooks((previous) => {
+              const merged = new Map(
+                previous.map((workbook) => [workbook.fileName, workbook])
+              );
+              parsed.forEach((workbook) =>
+                merged.set(workbook.fileName, workbook)
+              );
+              const next = [...merged.values()];
+
+              const failure = saveWorkbooks(next);
+              setStorageNotice(failure);
+              setSavedAt(failure ? null : new Date().toISOString());
+              return next;
+            });
+            setErrors(failures);
+          }}
+          onClear={() => {
+            clearWorkbooks();
+            setWorkbooks([]);
+            setErrors([]);
+            setFilters(initialFilters);
+            setStorageNotice(null);
+            setSavedAt(null);
+          }}
+        />
+
         <div className={styles.filters}>
-          {FILTERS.map((filter) => (
-            <div className={styles.filterField} key={filter.label}>
-              <span className={styles.filterLabel}>{filter.label}</span>
-              <div className={styles.filterValue}>
-                <span>{filter.value}</span>
-                <span>{"▾"}</span>
-              </div>
-            </div>
-          ))}
+          <FilterSelect
+            label="Month"
+            value={filters.month ?? "All"}
+            disabled={!isLive}
+            options={[
+              { value: "All", label: isLive ? "Latest" : "01-06-2026" },
+              ...model.monthOptions.map((month) => ({
+                value: month,
+                label: formatMonthKey(month)
+              }))
+            ]}
+            onChange={(value) => setFilter("month", value === "All" ? null : value)}
+          />
+          <FilterSelect
+            label="Age"
+            value="All"
+            disabled
+            options={[allOption]}
+            onChange={() => undefined}
+          />
+          <FilterSelect
+            label="Category"
+            value={fuel ?? filters.fuel}
+            disabled={!!fuel || !isLive}
+            options={
+              fuel
+                ? [{ value: fuel, label: fuel }]
+                : [
+                    allOption,
+                    { value: "EV", label: "EV" },
+                    { value: "ICE", label: "ICE" }
+                  ]
+            }
+            onChange={(value) =>
+              setFilter("fuel", value as NpsFilters["fuel"])
+            }
+          />
+          <FilterSelect
+            label="Subcategory"
+            value={filters.subcategory}
+            disabled={!isLive || model.subcategoryOptions.length === 0}
+            options={[
+              allOption,
+              ...model.subcategoryOptions.map((option) => ({
+                value: option,
+                label: option
+              }))
+            ]}
+            onChange={(value) =>
+              // Models belong to the ICE workbooks, so picking one implies ICE
+              // and clears any EV variant selection.
+              setFilters((previous) => ({
+                ...previous,
+                subcategory: value,
+                variant: "All",
+                fuel: fuel ?? (value === "All" ? previous.fuel : "ICE")
+              }))
+            }
+          />
+          <FilterSelect
+            label="Variant"
+            value={filters.variant}
+            disabled={!isLive || model.variantOptions.length === 0}
+            options={[
+              allOption,
+              ...model.variantOptions.map((option) => ({
+                value: option,
+                label: option
+              }))
+            ]}
+            onChange={(value) =>
+              setFilters((previous) => ({
+                ...previous,
+                variant: value,
+                subcategory: "All",
+                fuel: fuel ?? (value === "All" ? previous.fuel : "EV")
+              }))
+            }
+          />
         </div>
 
         <main className={styles.content}>
-          <div className={styles.sectionBanner}>EV Performance</div>
+          <div className={styles.sectionBanner}>
+            {filters.fuel === "All" ? "EV + ICE" : filters.fuel} Performance
+            {isLive
+              ? ""
+              : ` — demo data, upload the ${fuel ?? ""} workbooks to go live`}
+          </div>
+
+          {isLive && !model.hasData ? (
+            <p className={styles.emptyNote}>
+              No rows match this filter combination. Reset Category,
+              Subcategory or Variant to widen the selection.
+            </p>
+          ) : null}
 
           <div className={styles.topGrid}>
             <div className={styles.leftStack}>
@@ -404,63 +790,32 @@ export function ConnectedNpsDashboard() {
                     <strong>Connected NPS</strong>
                   </div>
                   <div className={styles.cardHeadRight}>
-                    <span>Current Month Sample : {CURRENT_MONTH_SAMPLE}</span>
+                    <span>
+                      Current Month Sample :{" "}
+                      {model.currentMonthSample.toLocaleString()}
+                      {model.currentMonthLabel
+                        ? ` (${model.currentMonthLabel})`
+                        : ""}
+                    </span>
                     <span className={`${styles.statusDot} ${styles.good}`} />
                   </div>
                 </div>
                 <div className={styles.yearTabs}>
-                  <span>2024</span>
-                  <span>2025</span>
-                  <span>2026</span>
-                  <span className={styles.yearActive}>2027</span>
+                  {model.fyBars.map((bar) => (
+                    <span key={bar.label}>{`20${bar.label.slice(0, 2)}`}</span>
+                  ))}
+                  <span className={styles.yearActive}>
+                    {`20${model.fiscalYearLabel.slice(0, 2)}`}
+                  </span>
                 </div>
                 <div className={styles.chartBody}>
-                  <NpsComboChart />
+                  <NpsComboChart model={model} />
                 </div>
                 <div className={styles.respLine}>
                   RESP(Responsible) : <strong>{RESPONSIBLE}</strong>
                 </div>
               </section>
 
-              <section className={styles.card}>
-                <div className={styles.cardHead}>
-                  <div className={styles.cardHeadLeft}>
-                    <strong>Last 8 Weeks Actual</strong>
-                  </div>
-                </div>
-                <div className={styles.tableScroll}>
-                  <table className={styles.table}>
-                    <thead>
-                      <tr>
-                        <th>Start of Week</th>
-                        {WEEKS.map((week) => (
-                          <th key={week}>{week}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <tr>
-                        <td>Actual</td>
-                        {WEEK_ACTUALS.map((value, index) => (
-                          <td key={`actual-${WEEKS[index]}`}>{value.toFixed(1)}</td>
-                        ))}
-                      </tr>
-                      <tr>
-                        <td>Target</td>
-                        {WEEK_TARGETS.map((value, index) => (
-                          <td key={`target-${WEEKS[index]}`}>{value.toFixed(1)}</td>
-                        ))}
-                      </tr>
-                      <tr>
-                        <td>Achievement%</td>
-                        {WEEKS.map((week) => (
-                          <td key={`ach-${week}`}>&nbsp;</td>
-                        ))}
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              </section>
             </div>
 
             <div className={styles.rightStack}>
@@ -471,28 +826,111 @@ export function ConnectedNpsDashboard() {
                   </div>
                 </div>
                 <div className={styles.legendRow}>
-                  <span className={styles.legendDialed}>Total Dialed</span>
-                  <span className={styles.legendClose}>Total Close Call</span>
-                  <span className={styles.legendResp}>Number of Respondents</span>
-                  <span className={styles.legendPct}>Respondent%</span>
+                  {model.usageAvailable ? (
+                    <>
+                      <span className={styles.legendDialed}>Total Customers</span>
+                      <span className={styles.legendUsing}>
+                        Customers using Connected Features app
+                      </span>
+                      <span className={styles.legendPct}>Percent</span>
+                    </>
+                  ) : (
+                    <>
+                      {model.sampleTrend.some((point) => point.dialed !== null) ? (
+                        <span className={styles.legendDialed}>Total Dialed</span>
+                      ) : null}
+                      {model.sampleTrend.some(
+                        (point) => point.closeCall !== null
+                      ) ? (
+                        <span className={styles.legendClose}>
+                          Total Close Call
+                        </span>
+                      ) : null}
+                      <span className={styles.legendResp}>
+                        Number of Respondents
+                      </span>
+                      {model.sampleTrend.some(
+                        (point) => point.respondentPct !== null
+                      ) ? (
+                        <span className={styles.legendPct}>Respondent%</span>
+                      ) : null}
+                    </>
+                  )}
                 </div>
                 <div className={styles.chartBody}>
-                  <SampleTrendChart />
+                  <SampleTrendChart points={model.sampleTrend} />
                 </div>
+                {isLive && !model.dialedAvailable ? (
+                  <p className={styles.emptyNote}>
+                    Dialed and close-call counts are not present in these
+                    workbooks, so only respondents are charted.
+                  </p>
+                ) : null}
               </section>
 
-              <section className={styles.card}>
-                <div className={styles.cardHead}>
-                  <div className={styles.cardHeadLeft}>
-                    <strong>Connected Rating Variance</strong>
-                  </div>
-                </div>
-                <div className={styles.variancePanel}>
-                  <VarianceChart />
-                </div>
-              </section>
             </div>
           </div>
+
+          <div className={styles.weeksBand}>
+            <section className={styles.card}>
+              <div className={styles.cardHead}>
+                <div className={styles.cardHeadLeft}>
+                  <strong>Last 8 Weeks Actual</strong>
+                </div>
+              </div>
+              {model.weeks.length === 0 ? (
+                <p className={styles.emptyNote}>
+                  No week-level rows for this selection. The workbook&apos;s
+                  Input sheet needs both a Date and an NPS Status column.
+                </p>
+              ) : (
+                <div className={styles.tableScroll}>
+                  <table className={styles.table}>
+                    <thead>
+                      <tr>
+                        <th>Start of Week</th>
+                        {model.weeks.map((week) => (
+                          <th key={week.label}>{week.label}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr>
+                        <td>Actual</td>
+                        {model.weeks.map((week) => (
+                          <td key={`actual-${week.label}`}>
+                            {week.nps === null ? "—" : week.nps.toFixed(1)}
+                          </td>
+                        ))}
+                      </tr>
+                      <tr>
+                        <td>Target</td>
+                        {model.weeks.map((week) => (
+                          <td key={`target-${week.label}`}>0.0</td>
+                        ))}
+                      </tr>
+                      <tr>
+                        <td>Responses</td>
+                        {model.weeks.map((week) => (
+                          <td key={`n-${week.label}`}>
+                            {week.total > 0 ? week.total.toLocaleString() : "—"}
+                          </td>
+                        ))}
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+          </div>
+
+          {model.warnings.length > 0 ? (
+            <ul className={styles.warningList}>
+              {model.warnings.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+          ) : null}
         </main>
       </div>
     </div>

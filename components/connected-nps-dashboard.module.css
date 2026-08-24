@@ -313,3 +313,208 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+/* --- Excel upload + data-driven states ----------------------------------- */
+
+.filterValue {
+  padding: 0;
+}
+
+.filterSelect {
+  width: 100%;
+  padding: 0.5rem 0.7rem;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, #94a3b8 50%),
+    linear-gradient(135deg, #94a3b8 50%, transparent 50%);
+  background-position: right 0.85rem center, right 0.6rem center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+
+.filterSelect:disabled {
+  cursor: not-allowed;
+  color: #94a3b8;
+}
+
+.uploadCard {
+  margin: 1rem 1.5rem 0;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.dropZone {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1.2rem;
+  border: 1.5px dashed #c3d0e2;
+  border-radius: 10px;
+  background: #fbfdff;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.dropZoneActive {
+  border-color: var(--nps-blue);
+  background: #f2f7ff;
+}
+
+.dropZoneText {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.dropZoneText strong {
+  color: #1f2937;
+  font-size: 0.95rem;
+}
+
+.dropZoneText span {
+  color: #64748b;
+  font-size: 0.8rem;
+}
+
+.dropZoneActions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.primaryButton,
+.secondaryButton {
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.primaryButton {
+  background: var(--nps-blue);
+  color: #ffffff;
+}
+
+.secondaryButton {
+  background: #ffffff;
+  border-color: #cbd5e1;
+  color: #475569;
+}
+
+.primaryButton:disabled,
+.secondaryButton:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.hiddenInput {
+  display: none;
+}
+
+.fileList {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.fileChip {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #ffffff;
+  font-size: 0.8rem;
+}
+
+.tagEv,
+.tagIce {
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: #ffffff;
+}
+
+.tagEv {
+  background: #1f9d55;
+}
+
+.tagIce {
+  background: #4f8ef0;
+}
+
+.fileName {
+  color: #1f2937;
+  font-weight: 600;
+}
+
+.fileMeta {
+  color: #64748b;
+}
+
+.errorList,
+.warningList {
+  margin: 0;
+  padding: 0.6rem 0.9rem 0.6rem 1.8rem;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.errorList {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #b91c1c;
+}
+
+.warningList {
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  color: #92400e;
+}
+
+.emptyNote {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  color: #64748b;
+  font-size: 0.82rem;
+}
+
+.legendUsing::before {
+  background: #1f9d55 !important;
+}
+
+.legendNotUsing::before {
+  background: #e2703a !important;
+}
+
+.legendNoResponse::before {
+  background: #94a3b8 !important;
+}
+
+/* The Last 8 Weeks table sits on its own centred band below the two columns. */
+.weeksBand {
+  display: flex;
+  justify-content: center;
+}
+
+.weeksBand > section {
+  width: 100%;
+  max-width: 900px;
+}
+
+.weeksBand .table {
+  margin: 0 auto;
+}
