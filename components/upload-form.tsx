@@ -69,6 +69,7 @@ type ConsolidatedRow = {
   "L3 Driver": string;
   "L2 Driver": string;
   "L1 Driver": string;
+  Summary: string;
 };
 
 type StatisticCard = {
@@ -88,7 +89,8 @@ const conversationDataHeaders = [
   "L2 Driver",
   "L1 Driver",
   "Rating",
-  "Next Step"
+  "Next Step",
+  "Summary"
 ];
 
 const consolidatedHeaders = [
@@ -100,7 +102,8 @@ const consolidatedHeaders = [
   "Voice Of Customer",
   "L3 Driver",
   "L2 Driver",
-  "L1 Driver"
+  "L1 Driver",
+  "Summary"
 ];
 
 class ProcessError extends Error {
@@ -261,8 +264,16 @@ function getDriverAndRatingValues(row: ConversationDataRow) {
 function hasDriverOrRatingData(row: ConversationDataRow) {
   const values = getDriverAndRatingValues(row);
 
+  // A Summary-bearing row must survive the filter even when it has no
+  // rating/driver data of its own (it's typically the file's first row,
+  // e.g. a greeting) — otherwise the per-file Summary would be dropped
+  // before it ever reaches the consolidated workbook or per-file tabs.
   return Boolean(
-    values.rating || values.l3Driver || values.l2Driver || values.l1Driver
+    values.rating ||
+      values.l3Driver ||
+      values.l2Driver ||
+      values.l1Driver ||
+      getCellText(row, "Summary")
   );
 }
 
@@ -303,7 +314,11 @@ function buildConsolidatedRows(params: {
         "Voice Of Customer": getCellText(row, "Notes"),
         "L3 Driver": l3Driver,
         "L2 Driver": l2Driver,
-        "L1 Driver": l1Driver
+        "L1 Driver": l1Driver,
+        // Only the row that originally carried the file's Summary (the
+        // file's first surviving row) has non-empty text here, so this
+        // naturally lands on just the first row of each file's frame.
+        Summary: getCellText(row, "Summary")
       };
     }
   );

@@ -9,8 +9,12 @@ function normalizeVehicleTerms(value: string) {
     .replace(/\bcar\b/gi, "two wheeler");
 }
 
-export function buildWorkbook(rows: ExtractionRow[], transcript: string) {
-  const worksheetRows = rows.map((row) => {
+export function buildWorkbook(
+  rows: ExtractionRow[],
+  transcript: string,
+  callSummary: string = ""
+) {
+  const worksheetRows = rows.map((row, index) => {
     const hierarchy = resolveDriverHierarchy(row);
 
     return {
@@ -24,7 +28,12 @@ export function buildWorkbook(rows: ExtractionRow[], transcript: string) {
       "L2 Driver": normalizeVehicleTerms(hierarchy.l2Driver),
       "L1 Driver": normalizeVehicleTerms(hierarchy.l1Driver),
       Rating: normalizeVehicleTerms(row.rating),
-      "Next Step": normalizeVehicleTerms(row.nextStep)
+      "Next Step": normalizeVehicleTerms(row.nextStep),
+      // Only the first row carries the call-level Summary — repeating it on
+      // every row would be redundant, so downstream consumers (consolidated
+      // workbook, per-file tabs) can rely on "first row of the file" as the
+      // single source of this value.
+      Summary: index === 0 ? normalizeVehicleTerms(callSummary) : ""
     };
   });
 
@@ -40,7 +49,8 @@ export function buildWorkbook(rows: ExtractionRow[], transcript: string) {
       "L2 Driver",
       "L1 Driver",
       "Rating",
-      "Next Step"
+      "Next Step",
+      "Summary"
     ]
   });
 

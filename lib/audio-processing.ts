@@ -1,4 +1,8 @@
-import { extractRowsFromTranscript, transcribeAudioBuffer } from "@/lib/ai";
+import {
+  extractRowsFromTranscript,
+  generateCallSummary,
+  transcribeAudioBuffer
+} from "@/lib/ai";
 import { buildDriverMetrics, type DriverMetrics } from "@/lib/driver-metrics";
 import { buildWorkbook } from "@/lib/excel";
 
@@ -55,7 +59,8 @@ export async function processAudioBuffer(params: {
   }
 
   const driverMetrics = buildDriverMetrics(rows);
-  const workbookBuffer = buildWorkbook(rows, summary);
+  const callSummary = await generateCallSummary({ rows, driverMetrics });
+  const workbookBuffer = buildWorkbook(rows, summary, callSummary);
 
   return {
     fileName: `${params.fileName.replace(/\.[^/.]+$/, "") || "conversation"}-data.xlsx`,

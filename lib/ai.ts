@@ -7,7 +7,12 @@ import {
   preprocessAudioBufferForTranscription,
   WHISPER_MAX_FILE_BYTES
 } from "@/lib/audio-chunking";
+import {
+  buildCallSummaryFacts,
+  buildDeterministicCallSummary
+} from "@/lib/call-summary";
 import { resolveDriverHierarchy } from "@/lib/driver-taxonomy";
+import type { DriverMetrics } from "@/lib/driver-metrics";
 import type { ExtractionRow } from "@/lib/types";
 import { runTranscriptionTask } from "@/lib/transcription-queue";
 
@@ -219,6 +224,23 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// On a 429, OpenAI tells us exactly how long to wait via Retry-After —
+// worth honoring directly instead of guessing with a fixed backoff,
+// especially under concurrent multi-file load where several chunks can hit
+// the same rate-limit window at once. Falls back to exponential backoff
+// (capped at 20s) for errors that don't carry that header.
+function getRetryDelayMs(error: unknown, attempt: number) {
+  if (error instanceof APIError) {
+    const retryAfterSeconds = Number(error.headers?.get?.("retry-after"));
+
+    if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+      return Math.min(retryAfterSeconds * 1000 + 500, 30000);
+    }
+  }
+
+  return Math.min(1000 * 2 ** attempt, 20000);
+}
+
 function isRetryableTranscriptionError(error: unknown) {
   if (error instanceof APIError) {
     return error.status === 429 || (error.status ?? 0) >= 500;
@@ -233,6 +255,18 @@ function isRetryableExtractionError(error: unknown) {
   }
 
   return error instanceof SyntaxError || error instanceof z.ZodError;
+}
+
+// Retries were previously silent — a run that fully recovered and a run
+// that hit sustained rate limiting looked identical in the logs. This
+// gives visibility into which one is actually happening, especially under
+// concurrent multi-file load where OpenAI 429s are the leading suspect.
+function describeApiError(error: unknown) {
+  if (error instanceof APIError) {
+    return `HTTP ${error.status ?? "?"} ${error.code ?? error.name}: ${error.message}`;
+  }
+
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
 
 function getExtractionChunkCharLimit() {
@@ -314,6 +348,94 @@ function isPartialTranscription(params: {
   return charsPerSecond < 3;
 }
 
+function normalizeSegmentTextForRepetitionCheck(text: string) {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[.,!?]+$/g, "")
+    .replace(/\s+/g, " ");
+}
+
+/**
+ * Whisper's repetition-hallucination loop (the model gets stuck repeating
+ * itself instead of transcribing real speech) produces plenty of text
+ * spread across the full audio duration, so it sails right past
+ * isPartialTranscription's "too little text" check. Its signature is a
+ * short window of consecutive segments cycling through only one or two
+ * distinct phrases — either the same phrase over and over ("I am using
+ * it." x6) or two phrases alternating ("So, every month? / Yes, sir." x13).
+ * Genuine dialogue naturally introduces more lexical variety even across
+ * short back-and-forth exchanges, so this doesn't trigger on real
+ * conversation — only on a sustained one- or two-phrase cycle.
+ */
+function hasRepetitionLoop(segments: TranscriptionResult["segments"]) {
+  const WINDOW_SIZE = 6;
+  const MAX_DISTINCT_PHRASES_IN_WINDOW = 2;
+  // Deliberately low: 6 consecutive segments cycling through only 1-2
+  // phrases is already a strong loop signal on its own, even when each
+  // repeat is short ("Thank you." x15 is a real, observed failure mode).
+  // This is just a sanity floor against near-zero-length segments, not the
+  // primary gate — an unnecessary retry is far cheaper than shipping a
+  // looping transcript to a client.
+  const MIN_WINDOW_DURATION_SECONDS = 3;
+
+  if (segments.length < WINDOW_SIZE) {
+    return false;
+  }
+
+  for (let start = 0; start <= segments.length - WINDOW_SIZE; start += 1) {
+    const window = segments.slice(start, start + WINDOW_SIZE);
+    const normalizedTexts = window
+      .map((segment) => normalizeSegmentTextForRepetitionCheck(segment.text))
+      .filter(Boolean);
+
+    if (normalizedTexts.length < WINDOW_SIZE) {
+      continue;
+    }
+
+    const distinctPhrases = new Set(normalizedTexts);
+    const windowDuration = window.reduce(
+      (total, segment) => total + Math.max(0, segment.end - segment.start),
+      0
+    );
+
+    if (
+      distinctPhrases.size <= MAX_DISTINCT_PHRASES_IN_WINDOW &&
+      windowDuration >= MIN_WINDOW_DURATION_SECONDS
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * A quality proxy for picking the best of several imperfect transcription
+ * attempts. Raw text length is actively misleading here: a badly-looping
+ * attempt ("I am using it." x100) is *longer* than a clean attempt, so
+ * scoring by length alone would prefer the garbage one. Counting each
+ * distinct segment's text only once neutralizes that — a repeated phrase
+ * only contributes its length a single time, so real, varied content wins.
+ */
+function getUniqueContentLength(segments: TranscriptionResult["segments"]) {
+  const seen = new Set<string>();
+  let total = 0;
+
+  for (const segment of segments) {
+    const normalized = normalizeSegmentTextForRepetitionCheck(segment.text);
+
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+
+    seen.add(normalized);
+    total += segment.text.trim().length;
+  }
+
+  return total;
+}
+
 async function transcribeAudioChunk(params: {
   buffer: Buffer;
   fileName: string;
@@ -338,7 +460,15 @@ async function transcribeAudioChunk(params: {
 
   const language = process.env.OPENAI_TRANSCRIPTION_LANGUAGE?.trim();
   const maxAttempts = 4;
-  let lastText = "";
+
+  // Whisper is non-deterministic once temperature > 0: two calls at the
+  // same temperature can come back different quality, and — empirically,
+  // on real degraded call audio — a high temperature (~0.8) can make the
+  // model give up and return nothing at all instead of fixing a loop. So
+  // this keeps the best candidate seen across every attempt rather than
+  // trusting whichever attempt happens to run last.
+  let bestCandidate: TranscriptionResult | null = null;
+  let bestCandidateScore = -1;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const uploadFile = new File(
@@ -346,6 +476,12 @@ async function transcribeAudioChunk(params: {
       params.fileName,
       { type: getAudioMimeType(params.fileName) }
     );
+    // temperature: 0 (the API default) is greedy decoding, which is the
+    // setting most prone to Whisper's repetition-hallucination loop. A
+    // small non-zero temperature from the first attempt avoids it in most
+    // cases; escalating further on retry helps harder cases, capped well
+    // below the point where the model starts returning empty output.
+    const temperature = Math.min(0.2 * attempt, 0.6);
 
     let transcription: {
       text?: string;
@@ -358,11 +494,13 @@ async function transcribeAudioChunk(params: {
         ? await client.audio.translations.create({
             file: uploadFile,
             model,
+            temperature,
             response_format: "verbose_json"
           })
         : await client.audio.transcriptions.create({
             file: uploadFile,
             model,
+            temperature,
             response_format: "verbose_json",
             ...(language ? { language } : {})
           });
@@ -374,6 +512,10 @@ async function transcribeAudioChunk(params: {
       };
     } catch (error) {
       if (!isRetryableTranscriptionError(error) || attempt === maxAttempts) {
+        if (bestCandidate) {
+          return bestCandidate;
+        }
+
         const message =
           error instanceof Error
             ? error.message
@@ -382,7 +524,10 @@ async function transcribeAudioChunk(params: {
         throw new Error(message);
       }
 
-      await sleep(attempt * 2500);
+      console.warn(
+        `[transcription] retryable error for ${params.fileName} (attempt ${attempt}/${maxAttempts}): ${describeApiError(error)}`
+      );
+      await sleep(getRetryDelayMs(error, attempt));
       continue;
     }
 
@@ -394,47 +539,48 @@ async function transcribeAudioChunk(params: {
     );
 
     const text = buildTranscriptText({ ...transcription, segments });
-    lastText = text;
 
     if (!text.trim()) {
       if (attempt === maxAttempts) {
-        throw new Error(
-          `Transcription returned no text for ${params.fileName}. Check that the file is a supported audio format (MP3, WAV, M4A) and contains audible speech.`
-        );
+        break;
       }
 
       await sleep(attempt * 2500);
       continue;
     }
 
-    if (
+    const isClean =
       !isPartialTranscription({
         text,
         segments,
         duration: transcription.duration
-      }) ||
-      attempt === maxAttempts
-    ) {
-      return {
-        provider: "openai",
-        text,
-        segments
-      };
+      }) && !hasRepetitionLoop(segments);
+
+    if (isClean) {
+      return { provider: "openai", text, segments };
     }
 
-    await sleep(attempt * 2500);
+    // Not clean, but keep it if it has the most unique content seen so
+    // far — scored by deduplicated content, not raw length, so a
+    // heavily-looping attempt can't outscore a shorter-but-cleaner one.
+    const uniqueContentLength = getUniqueContentLength(segments);
+
+    if (uniqueContentLength > bestCandidateScore) {
+      bestCandidateScore = uniqueContentLength;
+      bestCandidate = { provider: "openai", text, segments };
+    }
+
+    if (attempt < maxAttempts) {
+      await sleep(attempt * 2500);
+    }
   }
 
-  if (lastText.trim()) {
-    return {
-      provider: "openai",
-      text: lastText,
-      segments: []
-    };
+  if (bestCandidate) {
+    return bestCandidate;
   }
 
   throw new Error(
-    `Transcription returned incomplete text for ${params.fileName} after ${maxAttempts} attempts.`
+    `Transcription returned no text for ${params.fileName}. Check that the file is a supported audio format (MP3, WAV, M4A) and contains audible speech.`
   );
 }
 
@@ -499,7 +645,12 @@ async function extractRowsFromTranscriptChunk(params: {
     params.totalChunks > 1
       ? `You are processing transcript part ${params.chunkIndex + 1} of ${params.totalChunks}. Extract only the events present in this part.`
       : "You are processing the full transcript.";
-  const maxAttempts = 3;
+  // Concurrent multi-file uploads run every chunk's extraction call
+  // unthrottled (unlike transcription, which is globally serialized), so
+  // this is the path most exposed to OpenAI rate limiting when several
+  // large files are queued at once. A thin 3-attempt/short-backoff budget
+  // can exhaust before a rate-limit window clears; this gives it more room.
+  const maxAttempts = 5;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
@@ -546,10 +697,19 @@ async function extractRowsFromTranscriptChunk(params: {
       return parsed.rows;
     } catch (error) {
       if (!isRetryableExtractionError(error) || attempt === maxAttempts) {
+        if (error instanceof APIError) {
+          console.warn(
+            `[extraction] giving up on chunk ${params.chunkIndex + 1}/${params.totalChunks} after ${attempt} attempt(s): ${describeApiError(error)}`
+          );
+        }
+
         throw error;
       }
 
-      await sleep(attempt * 2500);
+      console.warn(
+        `[extraction] retryable error on chunk ${params.chunkIndex + 1}/${params.totalChunks} (attempt ${attempt}/${maxAttempts}): ${describeApiError(error)}`
+      );
+      await sleep(getRetryDelayMs(error, attempt));
     }
   }
 
@@ -575,4 +735,106 @@ export async function extractRowsFromTranscript(params: {
   return enrichDriverHierarchy(
     deduplicateRepeatedRowFields(preserveSharedConversationFields(rows))
   );
+}
+
+/**
+ * Composes the per-file analytical "Summary" cell (ratings, promoter/
+ * passive/detractor status, complaints, improvement suggestions) as one
+ * short paragraph. Grounded on already-extracted structured facts (ratings,
+ * l3Driver, NPS status) so the model can't misstate a number that's already
+ * visible elsewhere in the sheet — it only has to write the prose around
+ * those facts. Reads condensed notes/l3Driver text rather than the full
+ * transcript, so this stays a small, fast call regardless of call length.
+ * Never throws: on any failure it falls back to a deterministic summary
+ * built straight from the same facts, so the column is never left blank.
+ */
+export async function generateCallSummary(params: {
+  rows: ExtractionRow[];
+  driverMetrics: DriverMetrics;
+}): Promise<string> {
+  const { rows, driverMetrics } = params;
+
+  if (!rows.length) {
+    return "";
+  }
+
+  const fallback = buildDeterministicCallSummary(
+    rows,
+    driverMetrics.connectedFeaturesNps
+  );
+  const { ratingClauses, complaintClauses, npsLabel } = buildCallSummaryFacts(
+    rows,
+    driverMetrics.connectedFeaturesNps
+  );
+  const noteLines = rows
+    .map((row) => [row.notes.trim(), row.l3Driver.trim()].filter(Boolean).join(" — "))
+    .filter(Boolean);
+
+  if (!ratingClauses.length && !complaintClauses.length && !noteLines.length) {
+    return "";
+  }
+
+  const factsBlock = [
+    ratingClauses.length ? `Ratings: ${ratingClauses.join(", ")}.` : "",
+    npsLabel ? `NPS status: ${npsLabel}` : "",
+    complaintClauses.length
+      ? `Customer problems/complaints noted: ${complaintClauses.join("; ")}.`
+      : "",
+    noteLines.length ? `Event notes:\n${noteLines.join("\n")}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const client = getClient();
+  const model = process.env.OPENAI_EXTRACTION_MODEL || "gpt-4.1-mini";
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const completion = await client.chat.completions.create({
+        model,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You write a short 2-4 sentence analytical summary of one customer support call, for a spreadsheet cell. Use only the facts given below — never invent ratings, names, or details not present in them. State the ratings first, using the exact numbers given, do not change them. Mention the customer's promoter/passive/detractor status only if it is given. Then summarize the customer's feedback, especially connected-feature or L3-driver problems, key complaints, and any improvement suggestions implied by the notes. Keep it concise, factual, plain prose, no bullet points, no headers, no markdown."
+          },
+          {
+            role: "user",
+            content: [
+              "Facts about this call:",
+              factsBlock,
+              "",
+              "Example of the tone and format expected (the facts in your answer must come only from above, not from this example):",
+              '"Vehicle rating 8/10, connected charger rating 9/10, and charger rating 8/10. Customer is happy with the overall performance. Customer complained that Bluetooth is not working. Charger quality should be improved."',
+              "",
+              "Write only the summary paragraph, nothing else."
+            ].join("\n")
+          }
+        ]
+      });
+
+      const text = completion.choices[0]?.message?.content?.trim();
+
+      if (text) {
+        return text;
+      }
+
+      break;
+    } catch (error) {
+      if (!isRetryableExtractionError(error) || attempt === maxAttempts) {
+        console.warn(
+          `[call-summary] giving up after ${attempt} attempt(s), using deterministic fallback: ${describeApiError(error)}`
+        );
+        break;
+      }
+
+      console.warn(
+        `[call-summary] retryable error (attempt ${attempt}/${maxAttempts}): ${describeApiError(error)}`
+      );
+      await sleep(getRetryDelayMs(error, attempt));
+    }
+  }
+
+  return fallback;
 }
