@@ -342,14 +342,17 @@ function buildConsolidatedWorksheet(
   });
 }
 
+function stripFileExtension(fileName: string) {
+  return fileName.replace(/\.[^/.]+$/, "").trim();
+}
+
 function buildWorksheetName(
   fileName: string,
   index: number,
   usedNames: Set<string>
 ) {
   const fallbackName = `Audio ${index + 1}`;
-  const fileNameWithoutExtension =
-    fileName.replace(/\.[^/.]+$/, "").trim() || fallbackName;
+  const fileNameWithoutExtension = stripFileExtension(fileName) || fallbackName;
   const cleanedName =
     fileNameWithoutExtension
       .replace(/[\\/?*\[\]:]/g, " ")
@@ -403,7 +406,7 @@ async function downloadConsolidatedWorkbook(items: UploadItem[]) {
 
     consolidatedRows.push(
       ...buildConsolidatedRows({
-        frameNo: item.inputFileName,
+        frameNo: stripFileExtension(item.inputFileName) || item.inputFileName,
         rows: filteredSheetRows,
         startIndex: consolidatedRows.length + 1
       })
