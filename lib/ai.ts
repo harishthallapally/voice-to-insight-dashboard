@@ -129,7 +129,41 @@ function mergeTranscriptionResults(
 
 function getClient() {
   const apiKey = getRequiredEnv("OPENAI_API_KEY");
-  return new OpenAI({ apiKey });
+  // The SDK's own built-in retry (default 2) sits underneath our explicit
+  // retry loops below and duplicates them — worse, on a multipart audio
+  // upload its internal retry has to resend the same request body, which
+  // can fail at the transport level instead of surfacing the original
+  // error cleanly. That's what was turning a clean "insufficient_quota"
+  // 429 into an opaque "Connection error.": the SDK's own retry attempt on
+  // that 429 failed to resend the file body, masking the real error. Our
+  // retry loops already construct a fresh request per attempt, so this is
+  // both redundant and actively harmful here.
+  return new OpenAI({ apiKey, maxRetries: 0 });
+}
+
+// insufficient_quota / credit_balance_exhausted are 429s that will never
+// succeed no matter how many times we retry — the account is simply out of
+// money. Treating them as "retryable" (they'd otherwise match the generic
+// 429 check) wastes attempts and delays the failure. Detected defensively
+// via both `code` and `type` since OpenAI has used slightly different
+// values for this across error variants.
+function isQuotaExhaustedError(error: unknown) {
+  if (!(error instanceof APIError) || error.status !== 429) {
+    return false;
+  }
+
+  const code = (error.code || "").toLowerCase();
+  const type = (error.type || "").toLowerCase();
+
+  return (
+    code.includes("credit") ||
+    code.includes("quota") ||
+    type.includes("quota")
+  );
+}
+
+function getQuotaExhaustedMessage(context: string) {
+  return `OpenAI account has run out of credits — ${context} was not processed. Add credits at https://platform.openai.com/settings/organization/billing/ and try again.`;
 }
 
 function pickMostCommonValue(values: string[]) {
@@ -241,6 +275,10 @@ function getRetryDelayMs(error: unknown, attempt: number) {
 }
 
 function isRetryableTranscriptionError(error: unknown) {
+  if (isQuotaExhaustedError(error)) {
+    return false;
+  }
+
   if (error instanceof APIError) {
     return error.status === 429 || (error.status ?? 0) >= 500;
   }
@@ -249,6 +287,10 @@ function isRetryableTranscriptionError(error: unknown) {
 }
 
 function isRetryableExtractionError(error: unknown) {
+  if (isQuotaExhaustedError(error)) {
+    return false;
+  }
+
   if (error instanceof APIError) {
     return error.status === 429 || (error.status ?? 0) >= 500;
   }
@@ -512,7 +554,17 @@ async function transcribeAudioChunk(params: {
     } catch (error) {
       if (!isRetryableTranscriptionError(error) || attempt === maxAttempts) {
         if (bestCandidate) {
+          console.warn(
+            `[transcription-cost] ${params.fileName}: gave up after API error on attempt ${attempt}/${maxAttempts}, returning best-effort result from an earlier attempt (${attempt} Whisper call(s) billed for this chunk)`
+          );
           return bestCandidate;
+        }
+
+        if (isQuotaExhaustedError(error)) {
+          console.error(
+            `[transcription-cost] ${params.fileName}: OpenAI credits exhausted on attempt ${attempt}/${maxAttempts}; not retrying further.`
+          );
+          throw new Error(getQuotaExhaustedMessage(params.fileName));
         }
 
         const message =
@@ -556,6 +608,11 @@ async function transcribeAudioChunk(params: {
       }) && !hasRepetitionLoop(segments);
 
     if (isClean) {
+      if (attempt > 1) {
+        console.log(
+          `[transcription-cost] ${params.fileName}: clean result on attempt ${attempt}/${maxAttempts} (${attempt} Whisper call(s) billed for this chunk)`
+        );
+      }
       return { provider: "openai", text, segments };
     }
 
@@ -575,9 +632,15 @@ async function transcribeAudioChunk(params: {
   }
 
   if (bestCandidate) {
+    console.warn(
+      `[transcription-cost] ${params.fileName}: no clean result in ${maxAttempts} attempts, returning best-effort (non-clean) result — ${maxAttempts} Whisper call(s) billed for this chunk`
+    );
     return bestCandidate;
   }
 
+  console.error(
+    `[transcription-cost] ${params.fileName}: all ${maxAttempts} attempts returned no usable text — ${maxAttempts} Whisper call(s) billed for this chunk with no result`
+  );
   throw new Error(
     `Transcription returned no text for ${params.fileName}. Check that the file is a supported audio format (MP3, WAV, M4A) and contains audible speech.`
   );
@@ -703,6 +766,15 @@ async function extractRowsFromTranscriptChunk(params: {
       return parsed.rows;
     } catch (error) {
       if (!isRetryableExtractionError(error) || attempt === maxAttempts) {
+        if (isQuotaExhaustedError(error)) {
+          console.error(
+            `[extraction-cost] chunk ${params.chunkIndex + 1}/${params.totalChunks}: OpenAI credits exhausted on attempt ${attempt}/${maxAttempts}; not retrying further.`
+          );
+          throw new Error(
+            getQuotaExhaustedMessage(`transcript chunk ${params.chunkIndex + 1}/${params.totalChunks}`)
+          );
+        }
+
         if (error instanceof APIError) {
           console.warn(
             `[extraction] giving up on chunk ${params.chunkIndex + 1}/${params.totalChunks} after ${attempt} attempt(s): ${describeApiError(error)}`
