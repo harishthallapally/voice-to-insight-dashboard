@@ -611,11 +611,19 @@ export function UploadForm() {
       value: formatFileSize(totalSelectedBytes)
     }
   ];
-  const isConsolidatedReady =
+  // Downloads should be available once every file has reached a terminal
+  // state (complete OR error) — not only when every file succeeded. A batch
+  // upload where some files fail (e.g. credits exhausted mid-run) should
+  // still let the client download Excel for whichever files did succeed,
+  // rather than blocking the buttons entirely. downloadAllWorkbooks and
+  // downloadConsolidatedWorkbook already skip failed items on their own.
+  const allFilesFinished =
     items.length > 0 &&
-    items.every(
-      (item) => item.status === "complete" && item.result?.workbookBase64
-    );
+    items.every((item) => item.status === "complete" || item.status === "error");
+  const hasDownloadableResult = items.some(
+    (item) => item.status === "complete" && item.result?.workbookBase64
+  );
+  const isConsolidatedReady = allFilesFinished && hasDownloadableResult;
 
   function resetOutputForNewFiles(fileNames: string[]) {
     setSelectedFileNames(fileNames);
@@ -994,8 +1002,10 @@ export function UploadForm() {
                     disabled={!isConsolidatedReady}
                     title={
                       isConsolidatedReady
-                        ? "Download every individual Excel file"
-                        : "Available after every file completes successfully"
+                        ? "Download every successfully processed Excel file"
+                        : allFilesFinished
+                          ? "No files completed successfully — nothing to download"
+                          : "Available once every file has finished processing"
                     }
                     onClick={() => {
                       try {
@@ -1018,8 +1028,10 @@ export function UploadForm() {
                     disabled={!isConsolidatedReady || isBuildingConsolidated}
                     title={
                       isConsolidatedReady
-                        ? "Download one Consolidated tab plus each file's Conversation Data tab"
-                        : "Available after every file completes successfully"
+                        ? "Download one Consolidated tab plus each successfully processed file's Conversation Data tab"
+                        : allFilesFinished
+                          ? "No files completed successfully — nothing to consolidate"
+                          : "Available once every file has finished processing"
                     }
                     onClick={() => {
                       void (async () => {
