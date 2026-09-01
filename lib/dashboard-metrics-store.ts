@@ -53,6 +53,12 @@ type UploadMetricEventRecord = {
   dateKey: string;
   createdAt: string;
   email: string;
+  // Only set on "success" events — the audio duration Whisper reported for
+  // this file, in seconds. Stored on the same record as fileName so it's
+  // directly queryable per file (Cosmos Data Explorer), e.g.:
+  //   SELECT c.fileName, c.durationSeconds, c.dateKey, c.createdAt FROM c
+  //   WHERE c.type = "uploadMetricEvent" AND c.eventType = "success"
+  durationSeconds?: number;
 };
 
 type DriverMetricRecord = {
@@ -115,6 +121,7 @@ type UploadMetricQueryRow = {
   dateKey?: string;
   createdAt?: string;
   count?: number;
+  durationSeconds?: number;
 };
 
 type DriverMetricQueryRow = {
@@ -256,6 +263,8 @@ function createEmptyMonthlyMetrics(monthKey = getCurrentMonthKey()) {
     successes: 0,
     failures: 0,
     uploadStatusByDate: [],
+    totalAudioSeconds: 0,
+    audioSecondsByDate: [],
     connectedFeaturesNps: createNpsMetrics(),
     connectedFeaturesNpsByDate: [],
     detractorsByDate: [],
@@ -395,7 +404,8 @@ function logMetricsDisabledOnce() {
 
 export async function recordUploadMetricEvent(
   eventType: UploadMetricEventType,
-  fileName = ""
+  fileName = "",
+  durationSeconds?: number
 ) {
   const config = getCosmosMetricsConfig();
   const container = getCosmosContainer(config);
@@ -412,7 +422,10 @@ export async function recordUploadMetricEvent(
     fileName,
     dateKey,
     createdAt: now.toISOString(),
-    email: getMetricEmailPlaceholder(id)
+    email: getMetricEmailPlaceholder(id),
+    ...(typeof durationSeconds === "number" && durationSeconds > 0
+      ? { durationSeconds }
+      : {})
   };
 
   await container.items.create(record);
@@ -420,7 +433,8 @@ export async function recordUploadMetricEvent(
 
 export async function safeRecordUploadMetricEvent(
   eventType: UploadMetricEventType,
-  fileName = ""
+  fileName = "",
+  durationSeconds?: number
 ) {
   // Azure and local recording are independent flags — either, both, or
   // neither can be active, and one failing must never affect the other or
@@ -433,14 +447,16 @@ export async function safeRecordUploadMetricEvent(
       }
 
       try {
-        await recordUploadMetricEvent(eventType, fileName);
+        await recordUploadMetricEvent(eventType, fileName, durationSeconds);
       } catch (error) {
         logMetricWarning(`record ${eventType}`, error);
       }
     })(),
-    recordUploadMetricEventLocal(eventType, fileName).catch((error) => {
-      logMetricWarning(`record ${eventType} locally`, error);
-    })
+    recordUploadMetricEventLocal(eventType, fileName, durationSeconds).catch(
+      (error) => {
+        logMetricWarning(`record ${eventType} locally`, error);
+      }
+    )
   ]);
 }
 
@@ -661,7 +677,7 @@ export async function getMonthlyUploadMetrics(monthKey = getCurrentMonthKey()) {
   const metrics: MonthlyUploadMetrics = createEmptyMonthlyMetrics(monthKey);
   const uploadQuerySpec = {
     query:
-      "SELECT c.eventType, c.dateKey, c.createdAt FROM c WHERE c.organizationId = @organizationId AND c.type = @type AND c.monthKey = @monthKey",
+      "SELECT c.eventType, c.dateKey, c.createdAt, c.durationSeconds FROM c WHERE c.organizationId = @organizationId AND c.type = @type AND c.monthKey = @monthKey",
     parameters: [
       {
         name: "@organizationId",
@@ -793,6 +809,7 @@ export async function getMonthlyUploadMetrics(monthKey = getCurrentMonthKey()) {
   const l2DateCounts = new Map<string, number>();
   const l1DateCounts = new Map<string, number>();
   const detractorDateCounts = new Map<string, number>();
+  const audioSecondsDateCounts = new Map<string, number>();
   const connectedFeaturesNpsDateMap = new Map<string, NpsMetrics>();
   const connectedFeaturesNpsTotals = createNpsMetrics();
 
@@ -833,6 +850,16 @@ export async function getMonthlyUploadMetrics(monthKey = getCurrentMonthKey()) {
 
       if (trendPoint) {
         trendPoint.successes += count;
+      }
+
+      const durationSeconds = Number(row.durationSeconds || 0);
+
+      if (durationSeconds > 0) {
+        metrics.totalAudioSeconds += durationSeconds;
+
+        if (date) {
+          incrementDateCount(audioSecondsDateCounts, date, durationSeconds);
+        }
       }
     }
 
@@ -924,6 +951,7 @@ export async function getMonthlyUploadMetrics(monthKey = getCurrentMonthKey()) {
     }))
     .sort((left, right) => left.date.localeCompare(right.date));
   metrics.detractorsByDate = toDateCounts(detractorDateCounts);
+  metrics.audioSecondsByDate = toDateCounts(audioSecondsDateCounts);
   metrics.l3DriversByDate = toDateCounts(l3DateCounts);
   metrics.l2DriversByDate = toDateCounts(l2DateCounts);
   metrics.l1DriversByDate = toDateCounts(l1DateCounts);

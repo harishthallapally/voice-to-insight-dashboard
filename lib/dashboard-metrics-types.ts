@@ -28,6 +28,11 @@ export type MonthlyUploadMetrics = {
   successes: number;
   failures: number;
   uploadStatusByDate: UploadStatusTrendPoint[];
+  // Total processed audio duration (successful files only), in seconds —
+  // tracked alongside file counts so OpenAI billing (which Whisper charges
+  // per minute of audio, not per file) can be cross-checked day by day.
+  totalAudioSeconds: number;
+  audioSecondsByDate: DateCount[];
   connectedFeaturesNps: NpsMetrics;
   connectedFeaturesNpsByDate: DateNpsMetric[];
   detractorsByDate: DateCount[];

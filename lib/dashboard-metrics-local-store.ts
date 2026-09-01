@@ -33,6 +33,7 @@ type LocalUploadEvent = {
   monthKey: string;
   dateKey: string;
   createdAt: string;
+  durationSeconds?: number;
 };
 
 type LocalDriverEvent = {
@@ -141,7 +142,8 @@ function appendEvent(event: LocalMetricEvent) {
 
 export async function recordUploadMetricEventLocal(
   eventType: UploadMetricEventType,
-  fileName = ""
+  fileName = "",
+  durationSeconds?: number
 ) {
   if (!isLocalMetricsEnabled()) {
     return;
@@ -155,7 +157,10 @@ export async function recordUploadMetricEventLocal(
     fileName,
     monthKey: getCurrentMonthKey(now),
     dateKey: getCurrentDateKey(now),
-    createdAt: now.toISOString()
+    createdAt: now.toISOString(),
+    ...(typeof durationSeconds === "number" && durationSeconds > 0
+      ? { durationSeconds }
+      : {})
   });
 }
 
@@ -254,6 +259,8 @@ function createEmptyMonthlyMetrics(monthKey: string): MonthlyUploadMetrics {
     successes: 0,
     failures: 0,
     uploadStatusByDate: [],
+    totalAudioSeconds: 0,
+    audioSecondsByDate: [],
     connectedFeaturesNps: createEmptyNpsMetrics(),
     connectedFeaturesNpsByDate: [],
     detractorsByDate: [],
@@ -302,6 +309,7 @@ export async function getMonthlyUploadMetricsLocal(
     l3: new Map()
   };
   const detractorDateCounts = new Map<string, number>();
+  const audioSecondsDateCounts = new Map<string, number>();
   const npsByDate = new Map<string, NpsMetrics>();
   const npsTotals = createEmptyNpsMetrics();
 
@@ -331,6 +339,14 @@ export async function getMonthlyUploadMetricsLocal(
             : "failures"
       ] += 1;
       point[event.eventType === "upload" ? "uploads" : event.eventType === "success" ? "successes" : "failures"] += 1;
+
+      if (event.eventType === "success" && event.durationSeconds) {
+        metrics.totalAudioSeconds += event.durationSeconds;
+        audioSecondsDateCounts.set(
+          event.dateKey,
+          (audioSecondsDateCounts.get(event.dateKey) ?? 0) + event.durationSeconds
+        );
+      }
     }
 
     if (event.kind === "driver") {
@@ -389,6 +405,7 @@ export async function getMonthlyUploadMetricsLocal(
   metrics.l2DriversByDate = toSortedDateCounts(driverDateCounts.l2);
   metrics.l1DriversByDate = toSortedDateCounts(driverDateCounts.l1);
   metrics.detractorsByDate = toSortedDateCounts(detractorDateCounts);
+  metrics.audioSecondsByDate = toSortedDateCounts(audioSecondsDateCounts);
   metrics.connectedFeaturesNps = {
     ...npsTotals,
     score: calculateNpsScore(npsTotals)

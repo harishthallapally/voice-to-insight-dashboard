@@ -172,7 +172,11 @@ async function runJob(jobId: string) {
       result,
       error: ""
     });
-    await safeRecordUploadMetricEvent("success", job.inputFileName);
+    await safeRecordUploadMetricEvent(
+      "success",
+      job.inputFileName,
+      result.durationSeconds
+    );
     await safeRecordDriverMetricCounts(result.driverMetrics, job.inputFileName);
   } catch (error) {
     if (error instanceof AudioProcessingError) {

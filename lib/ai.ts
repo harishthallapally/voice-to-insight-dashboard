@@ -65,6 +65,10 @@ type TranscriptionResult = {
     text: string;
     speaker?: string;
   }>;
+  // Audio duration in seconds, straight from Whisper's own response — free
+  // to capture (no extra API call) and the basis for per-file/day audio
+  // minutes tracking, separate from file-count tracking.
+  durationSeconds: number;
 };
 
 function getRequiredEnv(name: string) {
@@ -123,7 +127,11 @@ function mergeTranscriptionResults(
   return {
     provider: results[0]?.provider || "openai",
     text,
-    segments: results.flatMap((result) => result.segments)
+    segments: results.flatMap((result) => result.segments),
+    durationSeconds: results.reduce(
+      (total, result) => total + (result.durationSeconds || 0),
+      0
+    )
   };
 }
 
@@ -613,7 +621,12 @@ async function transcribeAudioChunk(params: {
           `[transcription-cost] ${params.fileName}: clean result on attempt ${attempt}/${maxAttempts} (${attempt} Whisper call(s) billed for this chunk)`
         );
       }
-      return { provider: "openai", text, segments };
+      return {
+        provider: "openai",
+        text,
+        segments,
+        durationSeconds: transcription.duration || 0
+      };
     }
 
     // Not clean, but keep it if it has the most unique content seen so
@@ -623,7 +636,12 @@ async function transcribeAudioChunk(params: {
 
     if (uniqueContentLength > bestCandidateScore) {
       bestCandidateScore = uniqueContentLength;
-      bestCandidate = { provider: "openai", text, segments };
+      bestCandidate = {
+        provider: "openai",
+        text,
+        segments,
+        durationSeconds: transcription.duration || 0
+      };
     }
 
     if (attempt < maxAttempts) {

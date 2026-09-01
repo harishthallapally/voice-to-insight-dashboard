@@ -12,6 +12,7 @@ export type AudioProcessingResult = {
   summary: string;
   workbookBase64: string;
   driverMetrics: DriverMetrics;
+  durationSeconds: number;
 };
 
 export class AudioProcessingError extends Error {
@@ -67,6 +68,7 @@ export async function processAudioBuffer(params: {
     transcriptionProvider: transcription.provider,
     summary,
     workbookBase64: workbookBuffer.toString("base64"),
-    driverMetrics
+    driverMetrics,
+    durationSeconds: Math.round(transcription.durationSeconds || 0)
   };
 }
