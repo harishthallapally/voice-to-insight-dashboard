@@ -56,6 +56,9 @@ export type DashboardModel = {
   currentMonthLabel: string;
   selectedMonthSample: number;
   selectedMonthLabel: string;
+  /** Promoter % and Passive % cards, same shape as the NPS chart. */
+  promoterPct: MetricSeries;
+  passivePct: MetricSeries;
   sampleTrend: SamplePoint[];
   weeks: WeekPoint[];
   monthOptions: string[];
@@ -65,6 +68,13 @@ export type DashboardModel = {
   usageAvailable: boolean;
   weeksFromDailyRows: boolean;
   warnings: string[];
+};
+
+const EMPTY_SERIES: MetricSeries = {
+  fyBars: [],
+  currentMonths: [],
+  previousMonths: [],
+  ytd: null
 };
 
 export const DEFAULT_FILTERS: NpsFilters = {
@@ -127,17 +137,73 @@ function matchesFilters(
   return true;
 }
 
-function buildMonthSeries(records: NpsRecord[], fiscalYear: number): MonthPoint[] {
+/** How a set of rows collapses to the single number a chart plots. */
+export type Aggregate = (rows: NpsRecord[]) => number | null;
+
+/** Share of respondents in one bucket, e.g. promoters / total as a percentage. */
+function shareOf(field: "promoters" | "passives" | "detractors"): Aggregate {
+  return (rows) => {
+    const total = rows.reduce((sum, row) => sum + row.total, 0);
+    if (total <= 0) return null;
+    const part = rows.reduce((sum, row) => sum + row[field], 0);
+    return (part / total) * 100;
+  };
+}
+
+export const AGGREGATES = {
+  nps: ((rows) => npsOf(rows)) as Aggregate,
+  promoterPct: shareOf("promoters"),
+  passivePct: shareOf("passives")
+};
+
+function buildMonthSeries(
+  records: NpsRecord[],
+  fiscalYear: number,
+  aggregate: Aggregate
+): MonthPoint[] {
   return FISCAL_MONTH_ORDER.map((monthIndex) => {
     const key = monthKeyFor(fiscalYear, monthIndex);
     const rows = records.filter((record) => record.month === key);
     return {
       month: key,
       label: formatMonthKey(key).split("-")[0],
-      nps: npsOf(rows),
+      nps: aggregate(rows),
       total: rows.reduce((sum, row) => sum + row.total, 0)
     };
   });
+}
+
+/**
+ * One chart's worth of figures: the preceding fiscal-year bars, this year's
+ * monthly line, last year's comparison line, and the YTD bar. Every card on
+ * the report is the same shape over a different aggregate.
+ */
+export type MetricSeries = {
+  fyBars: FyBar[];
+  currentMonths: MonthPoint[];
+  previousMonths: MonthPoint[];
+  ytd: number | null;
+};
+
+function buildSeries(
+  records: NpsRecord[],
+  fiscalYear: number,
+  aggregate: Aggregate
+): MetricSeries {
+  return {
+    // The three bars left of the line are the fiscal years preceding the
+    // current one; a year with no data renders as "NA".
+    fyBars: [3, 2, 1].map((offset) => {
+      const year = fiscalYear - offset;
+      return {
+        label: formatFiscalYear(year),
+        nps: aggregate(records.filter((row) => row.fiscalYear === year))
+      };
+    }),
+    currentMonths: buildMonthSeries(records, fiscalYear, aggregate),
+    previousMonths: buildMonthSeries(records, fiscalYear - 1, aggregate),
+    ytd: aggregate(records.filter((row) => row.fiscalYear === fiscalYear))
+  };
 }
 
 function startOfWeek(date: Date) {
@@ -234,6 +300,8 @@ export function buildDashboardModel(
     currentMonthLabel: "",
     selectedMonthSample: 0,
     selectedMonthLabel: "",
+    promoterPct: EMPTY_SERIES,
+    passivePct: EMPTY_SERIES,
     sampleTrend: [],
     weeks: [],
     monthOptions: [],
@@ -279,19 +347,11 @@ export function buildDashboardModel(
     ...records.map((row) => row.fiscalYear),
     ...usageFiscalYears
   );
-  const currentMonths = buildMonthSeries(records, fiscalYear);
-  const previousMonths = buildMonthSeries(records, fiscalYear - 1);
+  const npsSeries = buildSeries(records, fiscalYear, AGGREGATES.nps);
+  const promoterPct = buildSeries(records, fiscalYear, AGGREGATES.promoterPct);
+  const passivePct = buildSeries(records, fiscalYear, AGGREGATES.passivePct);
 
-  // The three bars to the left of the trend line are the fiscal years that
-  // precede the current one; a year with no data renders as "NA".
-  const fyBars: FyBar[] = [3, 2, 1].map((offset) => {
-    const year = fiscalYear - offset;
-    const rows = records.filter((row) => row.fiscalYear === year);
-    return { label: formatFiscalYear(year), nps: npsOf(rows) };
-  });
-
-  const currentFyRows = records.filter((row) => row.fiscalYear === fiscalYear);
-  const ytd = npsOf(currentFyRows);
+  const { fyBars, currentMonths, previousMonths, ytd } = npsSeries;
 
   // Months come from the Summary records plus any month the Raw tab covers, so
   // an adoption-only month still appears on the trend.
@@ -411,6 +471,8 @@ export function buildDashboardModel(
     currentMonthLabel: latestMonth ? formatMonthKey(latestMonth) : "",
     selectedMonthSample: selectedMonth ? totalFor(selectedMonth) : 0,
     selectedMonthLabel: selectedMonth ? formatMonthKey(selectedMonth) : "",
+    promoterPct,
+    passivePct,
     sampleTrend,
     weeks,
     monthOptions: monthsWithData,

@@ -50,7 +50,7 @@
 
 .filters {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0.9rem;
   padding: 1rem 1.5rem;
   background: #ffffff;
@@ -89,6 +89,9 @@
   padding: 1.1rem 1.5rem 2rem;
   display: grid;
   gap: 1rem;
+  /* Rows keep their natural height. Without this the grid stretches to fill
+     the viewport, inflating the banner and cards on shorter pages. */
+  align-content: start;
 }
 
 .sectionBanner {
@@ -517,4 +520,32 @@
 
 .weeksBand .table {
   margin: 0 auto;
+}
+
+.otherFuelNote {
+  margin: 0;
+  padding: 0.1rem 0.2rem;
+  color: #94a3b8;
+  font-size: 0.78rem;
+}
+
+.directionArrow {
+  display: inline-block;
+  margin-right: 0.35rem;
+  color: #64748b;
+  font-weight: 700;
+}
+
+/* Promoter % / Passive % sit as equal halves, unlike the asymmetric top row. */
+.shareGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  align-items: start;
+}
+
+@media (max-width: 1180px) {
+  .shareGrid {
+    grid-template-columns: 1fr;
+  }
 }

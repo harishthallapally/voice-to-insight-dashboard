@@ -5,6 +5,7 @@ import { useCallback, useRef, useState } from "react";
 import {
   formatFiscalYear,
   parseNpsWorkbook,
+  type FuelType,
   type ParsedWorkbook
 } from "@/lib/nps-excel";
 
@@ -17,7 +18,11 @@ import styles from "./connected-nps-dashboard.module.css";
 export type UploadError = { fileName: string; message: string };
 
 type Props = {
+  /** Only the workbooks this page uses; a fuel-scoped page never lists others. */
   workbooks: ParsedWorkbook[];
+  /** Cached workbooks belonging to the other fuel, shown as a note only. */
+  otherFuelCount?: number;
+  fuel?: FuelType;
   errors: UploadError[];
   /** ISO timestamp of the cached copy, when one is in use. */
   savedAt: string | null;
@@ -53,6 +58,8 @@ function usageTotalOf(workbook: ParsedWorkbook) {
 
 export function ConnectedNpsUpload({
   workbooks,
+  otherFuelCount = 0,
+  fuel,
   errors,
   savedAt,
   storageNotice,
@@ -111,9 +118,9 @@ export function ConnectedNpsUpload({
             {isReading ? "Reading workbooks…" : "Drop the NPS Excel files here"}
           </strong>
           <span>
-            Select them all at once — EV and ICE, current and previous year,
-            plus the NPS Dashboard file. Files are read in your browser and
-            never uploaded.
+            {fuel
+              ? `Select the ${fuel} workbooks — current and previous year, plus the monthly NPS Dashboard files. Files are read in your browser and never uploaded.`
+              : "Select them all at once — EV and ICE, current and previous year, plus the NPS Dashboard file. Files are read in your browser and never uploaded."}
             {savedAt && workbooks.length > 0
               ? ` Restored from this browser (saved ${formatSavedAt(savedAt) ?? "earlier"}).`
               : ""}
@@ -178,6 +185,14 @@ export function ConnectedNpsUpload({
             </li>
           ))}
         </ul>
+      ) : null}
+
+      {otherFuelCount > 0 ? (
+        <p className={styles.otherFuelNote}>
+          {otherFuelCount} other workbook{otherFuelCount === 1 ? "" : "s"} are
+          cached in this browser for the {fuel === "EV" ? "ICE" : "EV"} page and
+          are not used here.
+        </p>
       ) : null}
 
       {storageNotice ? (

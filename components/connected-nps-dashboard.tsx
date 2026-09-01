@@ -13,6 +13,7 @@ import {
   type DashboardModel,
   type FyBar,
   type MonthPoint,
+  type MetricSeries,
   type NpsFilters,
   type SamplePoint
 } from "@/lib/nps-metrics";
@@ -87,6 +88,26 @@ const DEMO_MODEL: DashboardModel = {
     { month: "d5", label: "Jul-26", respondents: 526, dialed: 841, closeCall: 841, respondentPct: 63, usage: null },
     { month: "d6", label: "Aug-26", respondents: 548, dialed: 730, closeCall: 699, respondentPct: 78, usage: null }
   ],
+  promoterPct: {
+    fyBars: [
+      { label: "23-24", nps: null },
+      { label: "24-25", nps: null },
+      { label: "25-26", nps: 59 }
+    ],
+    currentMonths: toDemoMonths([63, 60, 64, 66, 66, null, null, null, null, null, null, null]),
+    previousMonths: toDemoMonths([57, 59, 58, 56, 57, 59, 60, 61, 60, 61, 62, 62]),
+    ytd: 64
+  },
+  passivePct: {
+    fyBars: [
+      { label: "23-24", nps: null },
+      { label: "24-25", nps: null },
+      { label: "25-26", nps: 23 }
+    ],
+    currentMonths: toDemoMonths([21, 23, 25, 21, 24, null, null, null, null, null, null, null]),
+    previousMonths: toDemoMonths([26, 25, 24, 25, 24, 25, 23, 22, 23, 22, 21, 21]),
+    ytd: 23
+  },
   weeks: [
     { label: "21-Jun", nps: 52.2, total: 0 },
     { label: "28-Jun", nps: 50.6, total: 0 },
@@ -126,7 +147,29 @@ function buildScale(values: Array<number | null>) {
   return { upper, lower, ticks };
 }
 
-function NpsComboChart({ model }: { model: DashboardModel }) {
+type ComboChartProps = {
+  series: MetricSeries;
+  /** Line, point and YTD-bar colour for the current-year series. */
+  color: string;
+  /** Appended to every rendered value, e.g. "%" for the share charts. */
+  suffix?: string;
+  decimals?: number;
+  ariaLabel: string;
+};
+
+/**
+ * The report's signature chart: preceding fiscal years as outline bars, this
+ * year's line, last year's in grey, and a filled YTD bar. Shared by Connected
+ * NPS, Promoter % and Passive %, which differ only in aggregate and colour.
+ */
+function ComboChart({
+  series,
+  color,
+  suffix = "",
+  decimals = 0,
+  ariaLabel
+}: ComboChartProps) {
+  const fmt = (value: number) => `${value.toFixed(decimals)}${suffix}`;
   const width = 760;
   const height = 300;
   const left = 46;
@@ -137,15 +180,15 @@ function NpsComboChart({ model }: { model: DashboardModel }) {
   const plotHeight = height - top - bottom;
 
   const { upper, lower, ticks } = buildScale([
-    ...model.fyBars.map((bar) => bar.nps),
-    ...model.currentMonths.map((point) => point.nps),
-    ...model.previousMonths.map((point) => point.nps),
-    model.ytd
+    ...series.fyBars.map((bar) => bar.nps),
+    ...series.currentMonths.map((point) => point.nps),
+    ...series.previousMonths.map((point) => point.nps),
+    series.ytd
   ]);
 
   const categories = [
-    ...model.fyBars.map((bar) => bar.label),
-    ...model.currentMonths.map((point) => point.label),
+    ...series.fyBars.map((bar) => bar.label),
+    ...series.currentMonths.map((point) => point.label),
     "YTD"
   ];
   const slot = plotWidth / categories.length;
@@ -156,7 +199,7 @@ function NpsComboChart({ model }: { model: DashboardModel }) {
   };
   const baselineY = getY(0);
 
-  const monthlyStartIndex = model.fyBars.length;
+  const monthlyStartIndex = series.fyBars.length;
 
   /** Draws each unbroken run of points, so gaps in the data break the line. */
   const buildSegments = (points: MonthPoint[]) => {
@@ -183,7 +226,7 @@ function NpsComboChart({ model }: { model: DashboardModel }) {
       className={styles.chartSvg}
       viewBox={`0 0 ${width} ${height}`}
       role="img"
-      aria-label="Connected NPS trend chart"
+      aria-label={ariaLabel}
     >
       {ticks.map((tick) => {
         const y = getY(tick);
@@ -198,7 +241,7 @@ function NpsComboChart({ model }: { model: DashboardModel }) {
               strokeWidth={1}
             />
             <text x={left - 10} y={y + 4} fontSize={11} fill="#5a6b82" textAnchor="end">
-              {tick}
+              {`${tick}${suffix}`}
             </text>
           </g>
         );
@@ -212,7 +255,7 @@ function NpsComboChart({ model }: { model: DashboardModel }) {
         strokeWidth={1.4}
       />
 
-      {model.fyBars.map((bar: FyBar, index) => {
+      {series.fyBars.map((bar: FyBar, index) => {
         const x = getX(index);
         const barWidth = slot * 0.55;
 
@@ -254,13 +297,13 @@ function NpsComboChart({ model }: { model: DashboardModel }) {
               fill="#1f2937"
               textAnchor="middle"
             >
-              {bar.nps.toFixed(1)}
+              {fmt(bar.nps)}
             </text>
           </g>
         );
       })}
 
-      {buildSegments(model.previousMonths).map((points, index) => (
+      {buildSegments(series.previousMonths).map((points, index) => (
         <polyline
           key={`prev-${index}`}
           points={points}
@@ -269,49 +312,49 @@ function NpsComboChart({ model }: { model: DashboardModel }) {
           strokeWidth={1.6}
         />
       ))}
-      {buildSegments(model.currentMonths).map((points, index) => (
+      {buildSegments(series.currentMonths).map((points, index) => (
         <polyline
           key={`curr-${index}`}
           points={points}
           fill="none"
-          stroke="#1f9d55"
+          stroke={color}
           strokeWidth={2.4}
         />
       ))}
 
-      {model.currentMonths.map((point, index) => {
+      {series.currentMonths.map((point, index) => {
         if (point.nps === null) return null;
         const x = getX(monthlyStartIndex + index);
         const y = getY(point.nps);
 
         return (
           <g key={`point-${point.month}`}>
-            <circle cx={x} cy={y} r={3.2} fill="#1f9d55" stroke="#ffffff" strokeWidth={1.4} />
-            <text x={x} y={y - 10} fontSize={11} fontWeight={700} fill="#1f9d55" textAnchor="middle">
-              {point.nps.toFixed(1)}
+            <circle cx={x} cy={y} r={3.2} fill={color} stroke="#ffffff" strokeWidth={1.4} />
+            <text x={x} y={y - 10} fontSize={11} fontWeight={700} fill={color} textAnchor="middle">
+              {fmt(point.nps)}
             </text>
           </g>
         );
       })}
 
-      {model.ytd !== null ? (
+      {series.ytd !== null ? (
         <>
           <rect
             x={getX(ytdIndex) - slot * 0.28}
-            y={Math.min(getY(model.ytd), baselineY)}
+            y={Math.min(getY(series.ytd), baselineY)}
             width={slot * 0.56}
-            height={Math.abs(baselineY - getY(model.ytd))}
-            fill="#1f9d55"
+            height={Math.abs(baselineY - getY(series.ytd))}
+            fill={color}
           />
           <text
             x={getX(ytdIndex)}
-            y={Math.min(getY(model.ytd), baselineY) - 8}
+            y={Math.min(getY(series.ytd), baselineY) - 8}
             fontSize={12}
             fontWeight={700}
-            fill="#1f9d55"
+            fill={color}
             textAnchor="middle"
           >
-            {model.ytd.toFixed(1)}
+            {fmt(series.ytd)}
           </text>
         </>
       ) : null}
@@ -551,6 +594,69 @@ function SampleTrendChart({ points }: { points: SamplePoint[] }) {
   );
 }
 
+type ShareCardProps = {
+  uom: string;
+  title: string;
+  series: MetricSeries;
+  color: string;
+  /** Status dot colour: promoters rising is good, passives rising is not. */
+  tone: "good" | "bad";
+  /** Which way is the desirable direction for this measure. */
+  direction: "up" | "down";
+  fiscalYearLabel: string;
+};
+
+/** Promoter % / Passive % card - the NPS chart over a different aggregate. */
+function ShareCard({
+  uom,
+  title,
+  series,
+  color,
+  tone,
+  direction,
+  fiscalYearLabel
+}: ShareCardProps) {
+  return (
+    <section className={styles.card}>
+      <div className={styles.cardHead}>
+        <div className={styles.cardHeadLeft}>
+          <small>{uom}</small>
+          <strong>
+            <span className={styles.directionArrow} aria-hidden="true">
+              {direction === "up" ? "↑" : "↓"}
+            </span>
+            {title}
+          </strong>
+        </div>
+        <div className={styles.cardHeadRight}>
+          <span
+            className={`${styles.statusDot} ${
+              tone === "good" ? styles.good : styles.bad
+            }`}
+          />
+        </div>
+      </div>
+      <div className={styles.yearTabs}>
+        {series.fyBars.map((bar) => (
+          <span key={bar.label}>{`20${bar.label.slice(0, 2)}`}</span>
+        ))}
+        <span className={styles.yearActive}>
+          {`20${fiscalYearLabel.slice(0, 2)}`}
+        </span>
+      </div>
+      <div className={styles.chartBody}>
+        <ComboChart
+          series={series}
+          color={color}
+          suffix="%"
+          decimals={0}
+          ariaLabel={`${title} trend chart`}
+        />
+      </div>
+    </section>
+  );
+}
+
 type FilterSelectProps = {
   label: string;
   value: string;
@@ -652,7 +758,9 @@ export function ConnectedNpsDashboard({ fuel, title }: DashboardProps = {}) {
         <div className={styles.accentBar} />
 
         <ConnectedNpsUpload
-          workbooks={workbooks}
+          workbooks={scopedWorkbooks}
+          otherFuelCount={workbooks.length - scopedWorkbooks.length}
+          fuel={fuel}
           errors={errors}
           savedAt={savedAt}
           storageNotice={storageNotice}
@@ -675,12 +783,26 @@ export function ConnectedNpsDashboard({ fuel, title }: DashboardProps = {}) {
             setErrors(failures);
           }}
           onClear={() => {
-            clearWorkbooks();
-            setWorkbooks([]);
+            // On a fuel-scoped page, Clear drops only that fuel's workbooks -
+            // wiping the other page's uploads from here would be a surprise.
+            setWorkbooks((previous) => {
+              const next = fuel
+                ? previous.filter((workbook) => workbook.fuel !== fuel)
+                : [];
+
+              if (next.length === 0) {
+                clearWorkbooks();
+                setSavedAt(null);
+              } else {
+                const failure = saveWorkbooks(next);
+                setStorageNotice(failure);
+                setSavedAt(failure ? null : new Date().toISOString());
+              }
+              return next;
+            });
             setErrors([]);
             setFilters(initialFilters);
             setStorageNotice(null);
-            setSavedAt(null);
           }}
         />
 
@@ -697,13 +819,6 @@ export function ConnectedNpsDashboard({ fuel, title }: DashboardProps = {}) {
               }))
             ]}
             onChange={(value) => setFilter("month", value === "All" ? null : value)}
-          />
-          <FilterSelect
-            label="Age"
-            value="All"
-            disabled
-            options={[allOption]}
-            onChange={() => undefined}
           />
           <FilterSelect
             label="Category"
@@ -723,7 +838,7 @@ export function ConnectedNpsDashboard({ fuel, title }: DashboardProps = {}) {
             }
           />
           <FilterSelect
-            label="Subcategory"
+            label="Model"
             value={filters.subcategory}
             disabled={!isLive || model.subcategoryOptions.length === 0}
             options={[
@@ -809,7 +924,17 @@ export function ConnectedNpsDashboard({ fuel, title }: DashboardProps = {}) {
                   </span>
                 </div>
                 <div className={styles.chartBody}>
-                  <NpsComboChart model={model} />
+                  <ComboChart
+                    series={{
+                      fyBars: model.fyBars,
+                      currentMonths: model.currentMonths,
+                      previousMonths: model.previousMonths,
+                      ytd: model.ytd
+                    }}
+                    color="#1f9d55"
+                    decimals={0}
+                    ariaLabel="Connected NPS trend chart"
+                  />
                 </div>
                 <div className={styles.respLine}>
                   RESP(Responsible) : <strong>{RESPONSIBLE}</strong>
@@ -899,14 +1024,14 @@ export function ConnectedNpsDashboard({ fuel, title }: DashboardProps = {}) {
                         <td>Actual</td>
                         {model.weeks.map((week) => (
                           <td key={`actual-${week.label}`}>
-                            {week.nps === null ? "—" : week.nps.toFixed(1)}
+                            {week.nps === null ? "—" : Math.round(week.nps)}
                           </td>
                         ))}
                       </tr>
                       <tr>
                         <td>Target</td>
                         {model.weeks.map((week) => (
-                          <td key={`target-${week.label}`}>0.0</td>
+                          <td key={`target-${week.label}`}>0</td>
                         ))}
                       </tr>
                       <tr>
@@ -922,6 +1047,27 @@ export function ConnectedNpsDashboard({ fuel, title }: DashboardProps = {}) {
                 </div>
               )}
             </section>
+          </div>
+
+          <div className={styles.shareGrid}>
+            <ShareCard
+              uom="UOM : % of Customers (Rating: 9-10)"
+              title="Promoter %"
+              series={model.promoterPct}
+              color="#1f9d55"
+              tone="good"
+              direction="up"
+              fiscalYearLabel={model.fiscalYearLabel}
+            />
+            <ShareCard
+              uom="UOM : % of Customers (Rating: 7-8)"
+              title="Passive %"
+              series={model.passivePct}
+              color="#d92d20"
+              tone="bad"
+              direction="down"
+              fiscalYearLabel={model.fiscalYearLabel}
+            />
           </div>
 
           {model.warnings.length > 0 ? (
