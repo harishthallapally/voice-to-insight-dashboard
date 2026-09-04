@@ -18,6 +18,13 @@ import type { ExtractionRow } from "@/lib/types";
 const { APIError } = OpenAI;
 const DEFAULT_EXTRACTION_CHUNK_CHAR_LIMIT = 12000;
 const MIN_EXTRACTION_CHUNK_CHAR_LIMIT = 4000;
+// Short enough to isolate the stretch of audio that triggers a repetition
+// loop, long enough to keep whole exchanges (question + answer) intact so
+// extraction still sees complete events.
+const LOOP_RECOVERY_CHUNK_SECONDS = 60;
+// A person really can say "Okay. Okay." — two in a row is natural speech,
+// beyond that it's hallucination.
+const MAX_CONSECUTIVE_REPEATED_SEGMENTS = 2;
 
 const extractionSchema = z.object({
   rows: z.array(
@@ -485,11 +492,72 @@ function getUniqueContentLength(segments: TranscriptionResult["segments"]) {
   return total;
 }
 
+/**
+ * Last line of defence before a transcript reaches the spreadsheet: even
+ * after loop detection and chunked recovery, a chunk can still carry a
+ * residual run of hallucinated repeats (one recovered chunk held "Thank
+ * you." 66 times). Collapsing consecutive identical segments strips those
+ * without touching genuine repetition in real speech.
+ */
+function collapseRepeatedSegments(
+  result: TranscriptionResult
+): TranscriptionResult {
+  const segments: TranscriptionResult["segments"] = [];
+  let previousNormalized = "";
+  let repeatCount = 0;
+
+  for (const segment of result.segments) {
+    const normalized = normalizeSegmentTextForRepetitionCheck(segment.text);
+
+    if (normalized && normalized === previousNormalized) {
+      repeatCount += 1;
+
+      if (repeatCount >= MAX_CONSECUTIVE_REPEATED_SEGMENTS) {
+        continue;
+      }
+    } else {
+      previousNormalized = normalized;
+      repeatCount = 0;
+    }
+
+    segments.push(segment);
+  }
+
+  const droppedCount = result.segments.length - segments.length;
+
+  if (!droppedCount) {
+    return result;
+  }
+
+  console.warn(
+    `[transcription] collapsed ${droppedCount} repeated segment(s) of ${result.segments.length} before returning the transcript.`
+  );
+
+  return {
+    ...result,
+    segments,
+    text: segments
+      .map((segment) => segment.text.trim())
+      .filter(Boolean)
+      .join(" ")
+  };
+}
+
 async function transcribeAudioChunk(params: {
   buffer: Buffer;
   fileName: string;
   timeOffsetSeconds?: number;
+  /**
+   * Whether a detected repetition loop should trigger further attempts at a
+   * higher temperature. True for individual chunks (cheap to redo, and the
+   * escalation genuinely helps at that scale). False for the whole-file
+   * pass, where re-running the entire file is expensive and — verified on
+   * real client audio — lands in the same loop every time; the caller
+   * recovers by chunking instead.
+   */
+  retryOnRepetitionLoop?: boolean;
 }): Promise<TranscriptionResult> {
+  const retryOnRepetitionLoop = params.retryOnRepetitionLoop ?? true;
   const client = getClient();
   const configuredModel = process.env.OPENAI_TRANSCRIPTION_MODEL || "whisper-1";
   const model = "whisper-1";
@@ -608,12 +676,13 @@ async function transcribeAudioChunk(params: {
       continue;
     }
 
+    const looping = hasRepetitionLoop(segments);
     const isClean =
       !isPartialTranscription({
         text,
         segments,
         duration: transcription.duration
-      }) && !hasRepetitionLoop(segments);
+      }) && !looping;
 
     if (isClean) {
       if (attempt > 1) {
@@ -621,6 +690,22 @@ async function transcribeAudioChunk(params: {
           `[transcription-cost] ${params.fileName}: clean result on attempt ${attempt}/${maxAttempts} (${attempt} Whisper call(s) billed for this chunk)`
         );
       }
+      return {
+        provider: "openai",
+        text,
+        segments,
+        durationSeconds: transcription.duration || 0
+      };
+    }
+
+    // Retrying the whole file at a higher temperature does not break a
+    // repetition loop — hand it back immediately so the caller can recover
+    // by chunking, instead of paying for three more full-length passes that
+    // land in the same loop.
+    if (looping && !retryOnRepetitionLoop) {
+      console.warn(
+        `[transcription-cost] ${params.fileName}: repetition loop on attempt ${attempt}; skipping further full-file retries in favour of chunked recovery (${attempt} Whisper call(s) billed).`
+      );
       return {
         provider: "openai",
         text,
@@ -664,6 +749,76 @@ async function transcribeAudioChunk(params: {
   );
 }
 
+async function transcribeChunkedAudio(params: {
+  chunks: Awaited<ReturnType<typeof createAudioChunksFromBuffer>>;
+  chunkSeconds: number;
+}): Promise<TranscriptionResult> {
+  const results: TranscriptionResult[] = [];
+
+  for (const [index, chunk] of params.chunks.entries()) {
+    const result = await transcribeAudioChunk({
+      buffer: chunk.buffer,
+      fileName: chunk.name,
+      timeOffsetSeconds: index * params.chunkSeconds
+    });
+    results.push(result);
+  }
+
+  return mergeTranscriptionResults(results);
+}
+
+/**
+ * Whisper can fall into a repetition-hallucination loop partway through a
+ * file and then emit that one phrase for the entire remaining duration —
+ * on a real client call, 299 of 315 segments came back as "I will tell
+ * them." Retrying the whole file doesn't help (every temperature lands in
+ * the same loop), but the loop is triggered by one bad stretch of audio:
+ * splitting the file into short chunks isolates it, and the surrounding
+ * chunks transcribe cleanly. On the same file, chunked recovery returned
+ * the real conversation — ratings, complaints, connected-feature feedback —
+ * that the single pass had thrown away entirely.
+ */
+async function recoverFromRepetitionLoop(params: {
+  buffer: Buffer;
+  fileName: string;
+  singlePass: TranscriptionResult;
+}): Promise<TranscriptionResult> {
+  const { buffer, fileName, singlePass } = params;
+
+  console.warn(
+    `[transcription] ${fileName}: repetition loop detected in single-pass transcription; re-transcribing in ${LOOP_RECOVERY_CHUNK_SECONDS}s chunks to isolate the bad region.`
+  );
+
+  try {
+    const chunks = await createAudioChunksFromBuffer(buffer, fileName, {
+      chunkSeconds: LOOP_RECOVERY_CHUNK_SECONDS,
+      force: true
+    });
+    const recovered = await transcribeChunkedAudio({
+      chunks,
+      chunkSeconds: LOOP_RECOVERY_CHUNK_SECONDS
+    });
+    const recoveredScore = getUniqueContentLength(recovered.segments);
+    const singlePassScore = getUniqueContentLength(singlePass.segments);
+
+    console.warn(
+      `[transcription] ${fileName}: chunked recovery unique content ${recoveredScore} vs single pass ${singlePassScore} — using ${recoveredScore > singlePassScore ? "chunked recovery" : "single pass"}.`
+    );
+
+    // Duration is reported per chunk and summed, so it stays the real audio
+    // length either way — keep the single-pass value when it wins, since a
+    // failed/partial chunk set could under-report it.
+    return recoveredScore > singlePassScore
+      ? { ...recovered, durationSeconds: singlePass.durationSeconds || recovered.durationSeconds }
+      : singlePass;
+  } catch (error) {
+    console.warn(
+      `[transcription] ${fileName}: chunked recovery failed (${describeApiError(error)}); falling back to the single-pass result.`
+    );
+    return singlePass;
+  }
+}
+
 async function transcribeWithOpenAIFromBuffer(
   rawBuffer: Buffer,
   rawFileName: string
@@ -678,10 +833,17 @@ async function transcribeWithOpenAIFromBuffer(
   );
 
   if (buffer.byteLength <= WHISPER_MAX_FILE_BYTES) {
-    return transcribeAudioChunk({
+    const singlePass = await transcribeAudioChunk({
       buffer,
-      fileName
+      fileName,
+      retryOnRepetitionLoop: false
     });
+
+    if (!hasRepetitionLoop(singlePass.segments)) {
+      return singlePass;
+    }
+
+    return recoverFromRepetitionLoop({ buffer, fileName, singlePass });
   }
 
   const chunks = await createAudioChunksFromBuffer(buffer, fileName);
@@ -713,7 +875,9 @@ export async function transcribeAudioBuffer(
   // (lib/audio-chunking.ts), so there's no shared state that needs
   // serializing here; the retry/backoff hardening in transcribeAudioChunk
   // absorbs the rate-limit fallout that extra queue was guarding against.
-  return transcribeWithOpenAIFromBuffer(buffer, fileName);
+  return collapseRepeatedSegments(
+    await transcribeWithOpenAIFromBuffer(buffer, fileName)
+  );
 }
 
 export async function transcribeAudio(file: File): Promise<TranscriptionResult> {

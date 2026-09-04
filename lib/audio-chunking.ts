@@ -106,11 +106,26 @@ export async function preprocessAudioBufferForTranscription(
   }
 }
 
+export type AudioChunkOptions = {
+  /** Segment length in seconds. Defaults to CHUNK_SECONDS (10 minutes). */
+  chunkSeconds?: number;
+  /**
+   * Split even when the file is small enough for a single Whisper request.
+   * Used for repetition-loop recovery, where the point of splitting isn't
+   * size at all — it's isolating the bad audio region so a hallucination
+   * loop in one stretch can't swallow the rest of the conversation.
+   */
+  force?: boolean;
+};
+
 export async function createAudioChunksFromBuffer(
   buffer: Buffer,
-  fileName: string
+  fileName: string,
+  options: AudioChunkOptions = {}
 ): Promise<AudioChunk[]> {
-  if (buffer.byteLength <= WHISPER_MAX_FILE_BYTES) {
+  const chunkSeconds = options.chunkSeconds ?? CHUNK_SECONDS;
+
+  if (!options.force && buffer.byteLength <= WHISPER_MAX_FILE_BYTES) {
     return [{ buffer, name: fileName }];
   }
 
@@ -130,7 +145,7 @@ export async function createAudioChunksFromBuffer(
       "-f",
       "segment",
       "-segment_time",
-      String(CHUNK_SECONDS),
+      String(chunkSeconds),
       "-reset_timestamps",
       "1",
       "-acodec",
@@ -147,9 +162,7 @@ export async function createAudioChunksFromBuffer(
       .sort();
 
     if (!chunkFiles.length) {
-      throw new Error(
-        "Audio file exceeds Whisper size limits and could not be split for transcription."
-      );
+      throw new Error("ffmpeg produced no chunks for this audio file.");
     }
 
     return Promise.all(
@@ -161,9 +174,12 @@ export async function createAudioChunksFromBuffer(
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Audio chunking failed.";
+    const reason = options.force
+      ? `Could not split audio into ${chunkSeconds}s chunks for transcription recovery.`
+      : `Audio file is too large for a single transcription request (${(buffer.byteLength / (1024 * 1024)).toFixed(1)} MB).`;
 
     throw new Error(
-      `Audio file is too large for a single transcription request (${(buffer.byteLength / (1024 * 1024)).toFixed(1)} MB). ffmpeg is required in the runtime environment to enable automatic chunking. ${message}`
+      `${reason} ffmpeg is required in the runtime environment to enable automatic chunking. ${message}`
     );
   } finally {
     await rm(dir, { recursive: true, force: true });
