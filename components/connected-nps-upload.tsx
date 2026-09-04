@@ -5,6 +5,8 @@ import { useCallback, useRef, useState } from "react";
 import {
   formatFiscalYear,
   parseNpsWorkbook,
+  parsePlanCsv,
+  parsePlanWorkbook,
   type FuelType,
   type ParsedWorkbook
 } from "@/lib/nps-excel";
@@ -42,7 +44,7 @@ function formatSavedAt(iso: string) {
   });
 }
 
-const ACCEPTED = ".xlsx,.xls,.xlsm";
+const ACCEPTED = ".xlsx,.xls,.xlsm,.csv";
 
 function responseTotalOf(workbook: ParsedWorkbook) {
   return workbook.dailyRows.reduce((sum, row) => sum + row.count, 0);
@@ -80,8 +82,24 @@ export function ConnectedNpsUpload({
 
       for (const file of Array.from(fileList)) {
         try {
+          // A .csv is the planned-NPS file, not a workbook, and may carry both
+          // fuels - so it can yield more than one entry.
+          if (file.name.toLowerCase().endsWith(".csv")) {
+            parsed.push(...parsePlanCsv(file.name, await file.text()));
+            continue;
+          }
           const buffer = await file.arrayBuffer();
-          parsed.push(parseNpsWorkbook(file.name, buffer));
+          try {
+            parsed.push(parseNpsWorkbook(file.name, buffer));
+          } catch (workbookError) {
+            // Not a data workbook - it may be a plan file. If that fails too,
+            // report the original error, which is the more useful one.
+            try {
+              parsed.push(...parsePlanWorkbook(file.name, buffer, fuel));
+            } catch {
+              throw workbookError;
+            }
+          }
         } catch (error) {
           failures.push({
             fileName: file.name,
@@ -180,6 +198,9 @@ export function ConnectedNpsUpload({
                   : ""}
                 {usageTotalOf(workbook) > 0
                   ? ` · ${usageTotalOf(workbook).toLocaleString()} Yes/No answers`
+                  : ""}
+                {workbook.plan.length > 0
+                  ? ` · ${workbook.plan.length} planned month(s)`
                   : ""}
               </span>
             </li>

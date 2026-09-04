@@ -10,6 +10,7 @@ import {
 import {
   buildDashboardModel,
   DEFAULT_FILTERS,
+  type CategorySplit,
   type DashboardModel,
   type FyBar,
   type MonthPoint,
@@ -88,6 +89,8 @@ const DEMO_MODEL: DashboardModel = {
     { month: "d5", label: "Jul-26", respondents: 526, dialed: 841, closeCall: 841, respondentPct: 63, usage: null },
     { month: "d6", label: "Aug-26", respondents: 548, dialed: 730, closeCall: 699, respondentPct: 78, usage: null }
   ],
+  planMonths: toDemoMonths([48, 49, 50, 51, 52, 53, 54, 55, 55, 56, 57, 58]),
+  planAvailable: true,
   promoterPct: {
     fyBars: [
       { label: "23-24", nps: null },
@@ -108,6 +111,22 @@ const DEMO_MODEL: DashboardModel = {
     previousMonths: toDemoMonths([26, 25, 24, 25, 24, 25, 23, 22, 23, 22, 21, 21]),
     ytd: 23
   },
+  detractorPct: {
+    fyBars: [
+      { label: "23-24", nps: null },
+      { label: "24-25", nps: null },
+      { label: "25-26", nps: 18 }
+    ],
+    currentMonths: toDemoMonths([17, 17, 11, 12, 10, null, null, null, null, null, null, null]),
+    previousMonths: toDemoMonths([17, 16, 18, 19, 23, 20, 21, 19, 18, 17, 17, 16]),
+    ytd: 13
+  },
+  categoryByMonth: {
+    "2026-08": { promoters: 730, passives: 220, detractors: 50, total: 1000 }
+  },
+  osByMonth: { "2026-08": { android: 840, ios: 140, total: 980 } },
+  categoryMonths: ["2026-08"],
+  osMonths: ["2026-08"],
   weeks: [
     { label: "21-Jun", nps: 52.2, total: 0 },
     { label: "28-Jun", nps: 50.6, total: 0 },
@@ -147,6 +166,9 @@ function buildScale(values: Array<number | null>) {
   return { upper, lower, ticks };
 }
 
+/** Actual figures below plan are called out in red rather than the series colour. */
+const BELOW_PLAN_COLOR = "#d92d20";
+
 type ComboChartProps = {
   series: MetricSeries;
   /** Line, point and YTD-bar colour for the current-year series. */
@@ -154,6 +176,8 @@ type ComboChartProps = {
   /** Appended to every rendered value, e.g. "%" for the share charts. */
   suffix?: string;
   decimals?: number;
+  /** Optional planned series, drawn as a blue reference line. */
+  plan?: MonthPoint[];
   ariaLabel: string;
 };
 
@@ -167,6 +191,7 @@ function ComboChart({
   color,
   suffix = "",
   decimals = 0,
+  plan,
   ariaLabel
 }: ComboChartProps) {
   const fmt = (value: number) => `${value.toFixed(decimals)}${suffix}`;
@@ -183,6 +208,7 @@ function ComboChart({
     ...series.fyBars.map((bar) => bar.nps),
     ...series.currentMonths.map((point) => point.nps),
     ...series.previousMonths.map((point) => point.nps),
+    ...(plan ?? []).map((point) => point.nps),
     series.ytd
   ]);
 
@@ -200,6 +226,19 @@ function ComboChart({
   const baselineY = getY(0);
 
   const monthlyStartIndex = series.fyBars.length;
+
+  /** True when this month has a plan and the actual fell short of it. */
+  const belowPlan = (index: number) => {
+    const actual = series.currentMonths[index]?.nps;
+    const planned = plan?.[index]?.nps;
+    return (
+      actual !== null &&
+      actual !== undefined &&
+      planned !== null &&
+      planned !== undefined &&
+      actual < planned
+    );
+  };
 
   /** Draws each unbroken run of points, so gaps in the data break the line. */
   const buildSegments = (points: MonthPoint[]) => {
@@ -312,25 +351,64 @@ function ComboChart({
           strokeWidth={1.6}
         />
       ))}
-      {buildSegments(series.currentMonths).map((points, index) => (
-        <polyline
-          key={`curr-${index}`}
-          points={points}
-          fill="none"
-          stroke={color}
-          strokeWidth={2.4}
-        />
-      ))}
+      {plan
+        ? buildSegments(plan).map((points, index) => (
+            <polyline
+              key={`plan-${index}`}
+              points={points}
+              fill="none"
+              stroke="#1d4ed8"
+              strokeWidth={1.6}
+            />
+          ))
+        : null}
+
+      {/* With a plan present the actual line is drawn segment by segment so a
+          month that falls short of plan turns red; otherwise one polyline. */}
+      {plan
+        ? series.currentMonths.map((point, index) => {
+            const next = series.currentMonths[index + 1];
+            if (point.nps === null || !next || next.nps === null) return null;
+
+            return (
+              <line
+                key={`curr-seg-${point.month}`}
+                x1={getX(monthlyStartIndex + index)}
+                y1={getY(point.nps)}
+                x2={getX(monthlyStartIndex + index + 1)}
+                y2={getY(next.nps)}
+                stroke={belowPlan(index + 1) ? BELOW_PLAN_COLOR : color}
+                strokeWidth={2.4}
+              />
+            );
+          })
+        : buildSegments(series.currentMonths).map((points, index) => (
+            <polyline
+              key={`curr-${index}`}
+              points={points}
+              fill="none"
+              stroke={color}
+              strokeWidth={2.4}
+            />
+          ))}
 
       {series.currentMonths.map((point, index) => {
         if (point.nps === null) return null;
         const x = getX(monthlyStartIndex + index);
         const y = getY(point.nps);
+        const pointColor = belowPlan(index) ? BELOW_PLAN_COLOR : color;
 
         return (
           <g key={`point-${point.month}`}>
-            <circle cx={x} cy={y} r={3.2} fill={color} stroke="#ffffff" strokeWidth={1.4} />
-            <text x={x} y={y - 10} fontSize={11} fontWeight={700} fill={color} textAnchor="middle">
+            <circle cx={x} cy={y} r={3.2} fill={pointColor} stroke="#ffffff" strokeWidth={1.4} />
+            <text
+              x={x}
+              y={y - 10}
+              fontSize={11}
+              fontWeight={700}
+              fill={pointColor}
+              textAnchor="middle"
+            >
               {fmt(point.nps)}
             </text>
           </g>
@@ -591,6 +669,277 @@ function SampleTrendChart({ points }: { points: SamplePoint[] }) {
         );
       })}
     </svg>
+  );
+}
+
+type Slice = { label: string; value: number; color: string };
+
+/**
+ * Pie with leader lines, as on the source report. Slices are drawn from 12
+ * o'clock clockwise; a slice small enough to be unreadable still gets its
+ * label, pushed out on the leader line.
+ */
+function PieChart({ slices, ariaLabel }: { slices: Slice[]; ariaLabel: string }) {
+  const width = 420;
+  const height = 235;
+  const cx = width / 2;
+  const cy = height / 2 + 5;
+  const radius = 76;
+
+  const total = slices.reduce((sum, slice) => sum + slice.value, 0);
+  const present = slices.filter((slice) => slice.value > 0);
+
+  if (total <= 0 || present.length === 0) {
+    return <p className={styles.emptyNote}>No data for this selection.</p>;
+  }
+
+  const pointAt = (fraction: number, distance: number) => {
+    const angle = fraction * Math.PI * 2 - Math.PI / 2;
+    return [cx + Math.cos(angle) * distance, cy + Math.sin(angle) * distance];
+  };
+
+  let cursor = 0;
+
+  return (
+    <svg
+      className={styles.pieSvg}
+      viewBox={`0 0 ${width} ${height}`}
+      role="img"
+      aria-label={ariaLabel}
+    >
+      {present.map((slice) => {
+        const fraction = slice.value / total;
+        const start = cursor;
+        const end = cursor + fraction;
+        cursor = end;
+
+        const [sx, sy] = pointAt(start, radius);
+        const [ex, ey] = pointAt(end, radius);
+        const largeArc = fraction > 0.5 ? 1 : 0;
+
+        // A single slice covering everything cannot be drawn as an arc.
+        const path =
+          present.length === 1
+            ? `M ${cx} ${cy - radius} A ${radius} ${radius} 0 1 1 ${cx - 0.01} ${cy - radius} Z`
+            : `M ${cx} ${cy} L ${sx} ${sy} A ${radius} ${radius} 0 ${largeArc} 1 ${ex} ${ey} Z`;
+
+        const mid = (start + end) / 2;
+        const [lx, ly] = pointAt(mid, radius + 12);
+        const [tx, ty] = pointAt(mid, radius + 30);
+        const anchorRight = tx >= cx;
+
+        return (
+          <g key={slice.label}>
+            <path d={path} fill={slice.color} stroke="#ffffff" strokeWidth={1} />
+            <polyline
+              points={`${lx},${ly} ${tx},${ty} ${tx + (anchorRight ? 10 : -10)},${ty}`}
+              fill="none"
+              stroke="#94a3b8"
+              strokeWidth={1}
+            />
+            <text
+              x={tx + (anchorRight ? 14 : -14)}
+              y={ty + 4}
+              fontSize={12}
+              fill="#1f2937"
+              textAnchor={anchorRight ? "start" : "end"}
+            >
+              {`${slice.label} ${Math.round(fraction * 100)}%`}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+/**
+ * 100% stacked bars of promoter / passive / detractor share, one per month.
+ * Bar width is fixed to a twelve-month grid and the group is centred, so a
+ * partial year reads as a short run of normal bars rather than stretched ones.
+ */
+function StackedTrendChart({
+  months,
+  byMonth
+}: {
+  months: string[];
+  byMonth: Record<string, CategorySplit>;
+}) {
+  const width = 1180;
+  const height = 300;
+  const left = 52;
+  const right = 16;
+  const top = 22;
+  const bottom = 52;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+
+  if (months.length === 0) {
+    return <p className={styles.emptyNote}>No data for this selection.</p>;
+  }
+
+  const MAX_BARS = 12;
+  const slot = plotWidth / MAX_BARS;
+  const barWidth = Math.min(slot * 0.5, 56);
+  const groupWidth = slot * months.length;
+  const startX = left + (plotWidth - groupWidth) / 2;
+
+  const ticks = [0, 50, 100];
+  const getY = (percent: number) => top + (1 - percent / 100) * plotHeight;
+
+  const bands = [
+    { key: "promoters" as const, color: "#1f9d55", text: "#ffffff" },
+    { key: "passives" as const, color: "#f2b705", text: "#3a2c00" },
+    { key: "detractors" as const, color: "#e02b20", text: "#ffffff" }
+  ];
+
+  return (
+    <svg
+      className={styles.chartSvg}
+      viewBox={`0 0 ${width} ${height}`}
+      role="img"
+      aria-label="Promoter, passive and detractor trend"
+    >
+      {ticks.map((tick) => (
+        <g key={tick}>
+          <line
+            x1={left}
+            x2={width - right}
+            y1={getY(tick)}
+            y2={getY(tick)}
+            stroke="#e2e8f0"
+            strokeWidth={1}
+          />
+          <text
+            x={left - 10}
+            y={getY(tick) + 4}
+            fontSize={12}
+            fill="#5a6b82"
+            textAnchor="end"
+          >
+            {`${tick}%`}
+          </text>
+        </g>
+      ))}
+
+      {months.map((month, index) => {
+        const split = byMonth[month];
+        const x = startX + slot * index + (slot - barWidth) / 2;
+        const centre = x + barWidth / 2;
+        if (!split || split.total <= 0) return null;
+
+        // Each share is rounded on its own, as on the source report, so the
+        // three labels may total 99 or 101 while the bar itself stays exact.
+        let cursor = 0;
+
+        return (
+          <g key={month}>
+            {bands.map((band) => {
+              const share = (split[band.key] / split.total) * 100;
+              const y = getY(cursor + share);
+              const barHeight = (share / 100) * plotHeight;
+              cursor += share;
+
+              return (
+                <g key={band.key}>
+                  <rect
+                    x={x}
+                    y={y}
+                    width={barWidth}
+                    height={barHeight}
+                    fill={band.color}
+                  />
+                  {/* Below ~7% the segment is too thin to hold its label. */}
+                  {share >= 7 ? (
+                    <text
+                      x={centre}
+                      y={y + barHeight / 2 + 4}
+                      fontSize={12}
+                      fontWeight={700}
+                      fill={band.text}
+                      textAnchor="middle"
+                    >
+                      {`${Math.round(share)}%`}
+                    </text>
+                  ) : null}
+                </g>
+              );
+            })}
+            <text
+              x={centre}
+              y={height - bottom + 20}
+              fontSize={12}
+              fill="#5a6b82"
+              textAnchor="middle"
+            >
+              {formatMonthKey(month)}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+type PieCardProps = {
+  title: string;
+  ariaLabel: string;
+  /** Months this pie has data for, oldest first. */
+  months: string[];
+  /** Slices for one month; an empty array renders the "no data" note. */
+  slicesFor: (month: string) => Slice[];
+  emptyNote?: string;
+};
+
+/**
+ * A stratification pie with its own month selector, so each pie can be read
+ * month by month independently of the page-wide Month filter.
+ */
+function PieCard({
+  title,
+  ariaLabel,
+  months,
+  slicesFor,
+  emptyNote
+}: PieCardProps) {
+  const latest = months[months.length - 1] ?? "";
+  const [selected, setSelected] = useState(latest);
+
+  // Filters change which months exist, so fall back to the latest available
+  // rather than holding a month this selection no longer has.
+  const month = months.includes(selected) ? selected : latest;
+
+  return (
+    <section className={styles.card}>
+      <div className={styles.cardHead}>
+        <div className={styles.cardHeadLeft}>
+          <strong>{title}</strong>
+        </div>
+        <div className={styles.cardHeadRight}>
+          {months.length > 0 ? (
+            <select
+              className={styles.monthSelect}
+              value={month}
+              onChange={(event) => setSelected(event.target.value)}
+              aria-label={`${title} month`}
+            >
+              {[...months].reverse().map((option) => (
+                <option key={option} value={option}>
+                  {formatMonthKey(option)}
+                </option>
+              ))}
+            </select>
+          ) : null}
+        </div>
+      </div>
+      <div className={styles.chartBody}>
+        {month ? (
+          <PieChart ariaLabel={ariaLabel} slices={slicesFor(month)} />
+        ) : (
+          <p className={styles.emptyNote}>{emptyNote ?? "No data available."}</p>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -933,9 +1282,16 @@ export function ConnectedNpsDashboard({ fuel, title }: DashboardProps = {}) {
                     }}
                     color="#1f9d55"
                     decimals={0}
+                    plan={model.planAvailable ? model.planMonths : undefined}
                     ariaLabel="Connected NPS trend chart"
                   />
                 </div>
+                {model.planAvailable ? (
+                  <div className={styles.legendRow}>
+                    <span className={styles.legendActual}>Actual</span>
+                    <span className={styles.legendPlan}>Plan</span>
+                  </div>
+                ) : null}
                 <div className={styles.respLine}>
                   RESP(Responsible) : <strong>{RESPONSIBLE}</strong>
                 </div>
@@ -1069,6 +1425,71 @@ export function ConnectedNpsDashboard({ fuel, title }: DashboardProps = {}) {
               fiscalYearLabel={model.fiscalYearLabel}
             />
           </div>
+
+          <div className={styles.centerBand}>
+            <ShareCard
+              uom="UOM : % of Customers (Rating: 0-6)"
+              title="Detractor %"
+              series={model.detractorPct}
+              color="#d92d20"
+              tone="bad"
+              direction="down"
+              fiscalYearLabel={model.fiscalYearLabel}
+            />
+          </div>
+
+          <div className={styles.shareGrid}>
+            <PieCard
+              title="Stratification Of Customers Category"
+              ariaLabel="Stratification of customers by category"
+              months={model.categoryMonths}
+              slicesFor={(month) => {
+                const split = model.categoryByMonth[month];
+                if (!split) return [];
+                return [
+                  { label: "Promoter", value: split.promoters, color: "#1f9d55" },
+                  { label: "Passive", value: split.passives, color: "#f2b705" },
+                  { label: "Detractor", value: split.detractors, color: "#d92d20" }
+                ];
+              }}
+            />
+
+            <PieCard
+              title="Stratification Of Customers Mobile OS Type"
+              ariaLabel="Stratification of customers by mobile OS"
+              months={model.osMonths}
+              slicesFor={(month) => {
+                const split = model.osByMonth[month];
+                if (!split) return [];
+                return [
+                  { label: "Android", value: split.android, color: "#a78bfa" },
+                  { label: "IOS", value: split.ios, color: "#e0c341" }
+                ];
+              }}
+              emptyNote="These workbooks carry no Android/iOS column, so the platform mix is unavailable."
+            />
+          </div>
+
+          <section className={styles.card}>
+            <div className={styles.cardHead}>
+              <div className={styles.cardHeadLeft}>
+                <strong>
+                  Promoter, Passive &amp; Detractor - Trend (Last 12 Months)
+                </strong>
+              </div>
+            </div>
+            <div className={styles.chartBody}>
+              <StackedTrendChart
+                months={model.categoryMonths.slice(-12)}
+                byMonth={model.categoryByMonth}
+              />
+            </div>
+            <div className={styles.legendRow}>
+              <span className={styles.legendActual}>Promoter%</span>
+              <span className={styles.legendPassive}>Passive%</span>
+              <span className={styles.legendDetractor}>Detractor%</span>
+            </div>
+          </section>
 
           {model.warnings.length > 0 ? (
             <ul className={styles.warningList}>

@@ -57,6 +57,43 @@ export type UsageRecord = {
   noResponse: number;
 };
 
+/** Phone platform split, from the Input sheet's "Android/iOS" column. */
+export type OsRecord = {
+  fuel: FuelType;
+  month: string;
+  entity: string;
+  os: "android" | "ios";
+  count: number;
+};
+
+/**
+ * One planned NPS target, supplied via a plan file rather than a workbook.
+ * A plan may name its months absolutely ("Apr-26" -> month) or only by name
+ * ("April" -> fiscalMonthIndex 0), in which case it is resolved against
+ * whichever fiscal year the dashboard is showing.
+ */
+export type PlanRecord = {
+  fuel: FuelType;
+  month: string | null;
+  /** 0 = April ... 11 = March, when the source gave no year. */
+  fiscalMonthIndex: number | null;
+  plan: number;
+};
+
+/** Month name with no year, e.g. "April" -> 0 (April starts the fiscal year). */
+export function fiscalMonthIndexOf(raw: string): number | null {
+  const value = raw.trim().toLowerCase().replace(/^\d+\s*[.)]\s*/, "");
+  if (!value || /\d/.test(value)) return null;
+
+  const calendarIndex = MONTH_NAMES.findIndex((name) =>
+    name.startsWith(value.slice(0, 3))
+  );
+  if (calendarIndex === -1) return null;
+
+  // April is position 0 in the fiscal year.
+  return (calendarIndex + 9) % 12;
+}
+
 export type ParsedWorkbook = {
   fileName: string;
   fuel: FuelType;
@@ -66,6 +103,8 @@ export type ParsedWorkbook = {
   records: NpsRecord[];
   dailyRows: DailyRow[];
   usage: UsageRecord[];
+  osSplit: OsRecord[];
+  plan: PlanRecord[];
   /** Dialed / close-call counts by month key, when the workbook carries them. */
   callVolume: Record<string, { dialed?: number; closeCall?: number }>;
   warnings: string[];
@@ -385,6 +424,57 @@ export function excelSerialToDate(serial: number): Date | null {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+/**
+ * Reads the phone platform column of the Input sheet, aggregated per month,
+ * model and platform. Only "android" and "ios" count - blanks, "null" and "0"
+ * mean the question was not captured, not a third platform.
+ */
+function parseOsSplit(grid: Grid, fuel: FuelType): OsRecord[] {
+  if (grid.length < 2) return [];
+
+  const header = grid[0] ?? [];
+  const osColumn = headerIndexOf(header, (value) =>
+    value.replace(/\s+/g, "").includes("android/ios")
+  );
+  if (osColumn === -1) return [];
+
+  const monthColumn = headerIndexOf(header, (value) => value === "month");
+  const dateColumn = headerIndexOf(header, (value) => value === "date");
+  const modelColumn = headerIndexOf(header, (value) =>
+    value.includes("vehicle model")
+  );
+
+  const buckets = new Map<string, OsRecord>();
+
+  for (let index = 1; index < grid.length; index += 1) {
+    const row = grid[index] ?? [];
+
+    const raw = String(row[osColumn] ?? "").trim().toLowerCase();
+    const os = raw === "android" ? "android" : raw === "ios" ? "ios" : null;
+    if (!os) continue;
+
+    let month = "";
+    const stated = monthColumn === -1 ? null : parseMonthLabel(row[monthColumn]);
+    if (stated) {
+      month = monthKey(stated.monthIndex, stated.year);
+    } else if (dateColumn !== -1) {
+      const date = parseRowDate(row[dateColumn]);
+      if (date) month = monthKey(date.getUTCMonth(), date.getUTCFullYear());
+    }
+    if (!month) continue;
+
+    const entity =
+      modelColumn === -1 ? "" : String(row[modelColumn] ?? "").trim();
+    const key = `${month}|${entity}|${os}`;
+
+    const existing = buckets.get(key);
+    if (existing) existing.count += 1;
+    else buckets.set(key, { fuel, month, entity, os, count: 1 });
+  }
+
+  return [...buckets.values()];
+}
+
 /** Statuses appear both plural ("Promoters") and singular ("Promoter"). */
 function classifyStatus(raw: unknown): NpsStatus | null {
   if (typeof raw !== "string") return null;
@@ -630,6 +720,288 @@ function isNeededSheet(name: string) {
   );
 }
 
+/**
+ * Accepts the month spellings a plan file is likely to use: "Apr-26",
+ * "April'26", "2026-04", "Apr 2026".
+ */
+export function parsePlanMonth(raw: string): string | null {
+  const value = raw.trim();
+  if (!value) return null;
+
+  const iso = value.match(/^(\d{4})-(\d{1,2})$/);
+  if (iso) {
+    const month = Number(iso[2]);
+    if (month >= 1 && month <= 12) return `${iso[1]}-${String(month).padStart(2, "0")}`;
+  }
+
+  // "Apr-26" / "Apr 26" / "Apr/26" reduce to the workbook spelling.
+  const parsed = parseMonthLabel(value.replace(/[-/\s]+/g, "'"));
+  if (parsed) return monthKey(parsed.monthIndex, parsed.year);
+
+  const direct = parseMonthLabel(value);
+  return direct ? monthKey(direct.monthIndex, direct.year) : null;
+}
+
+/** Splits a CSV line, honouring simple double-quoted fields. */
+function splitCsvLine(line: string): string[] {
+  const cells: string[] = [];
+  let current = "";
+  let quoted = false;
+
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (char === '"') {
+      if (quoted && line[index + 1] === '"') {
+        current += '"';
+        index += 1;
+      } else quoted = !quoted;
+    } else if (char === "," && !quoted) {
+      cells.push(current);
+      current = "";
+    } else current += char;
+  }
+  cells.push(current);
+  return cells.map((cell) => cell.trim());
+}
+
+/**
+ * Reads a planned-NPS CSV of the form `fuel,month,plan`. Header names are
+ * matched loosely so "Fuel/Category", "Month" and "Plan/Target" all work.
+ * Returns one ParsedWorkbook per fuel, so a single file can carry both EV and
+ * ICE targets while each fuel-scoped page still sees only its own.
+ */
+export function parsePlanCsv(fileName: string, text: string): ParsedWorkbook[] {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length < 2) {
+    throw new Error("Plan CSV is empty or has no rows beneath its header.");
+  }
+
+  const header = splitCsvLine(lines[0]).map((cell) => cell.toLowerCase());
+  const fuelColumn = header.findIndex((cell) =>
+    /fuel|category|type/.test(cell)
+  );
+  const monthColumn = header.findIndex((cell) => /month|period|date/.test(cell));
+  const planColumn = header.findIndex((cell) =>
+    /plan|target|budget|goal/.test(cell)
+  );
+
+  if (monthColumn === -1 || planColumn === -1) {
+    throw new Error(
+      'Plan CSV needs "month" and "plan" columns (a "fuel" column too when it covers both EV and ICE).'
+    );
+  }
+
+  const byFuel = new Map<FuelType, PlanRecord[]>();
+  const warnings: string[] = [];
+  let skipped = 0;
+
+  for (let index = 1; index < lines.length; index += 1) {
+    const cells = splitCsvLine(lines[index]);
+
+    const rawFuel = (fuelColumn === -1 ? "" : cells[fuelColumn] ?? "").toUpperCase();
+    const fuel: FuelType = rawFuel.includes("EV") ? "EV" : "ICE";
+
+    const month = parsePlanMonth(cells[monthColumn] ?? "");
+    const plan = toNumber(cells[planColumn]);
+
+    if (!month || plan === null) {
+      skipped += 1;
+      continue;
+    }
+
+    const rows = byFuel.get(fuel) ?? [];
+    rows.push({ fuel, month, fiscalMonthIndex: null, plan });
+    byFuel.set(fuel, rows);
+  }
+
+  if (byFuel.size === 0) {
+    throw new Error(
+      "No usable rows in the plan CSV - check the month and plan columns."
+    );
+  }
+  if (skipped > 0) {
+    warnings.push(`${skipped} plan row(s) had an unreadable month or value.`);
+  }
+
+  return [...byFuel.entries()].map(([fuel, plan]) => {
+    const fiscalYears = plan
+      .filter((row): row is PlanRecord & { month: string } => row.month !== null)
+      .map((row) => {
+        const [year, month] = row.month.split("-").map(Number);
+        return fiscalYearOf(month - 1, year);
+      });
+
+    return {
+      // Suffixed so a file covering both fuels yields two distinct entries.
+      fileName: byFuel.size > 1 ? `${fileName} (${fuel})` : fileName,
+      fuel,
+      // A plan naming only month names carries no year; it is resolved against
+      // whichever fiscal year the dashboard is showing.
+      fiscalYear:
+        fiscalYears.length > 0
+          ? Math.max(...fiscalYears)
+          : fiscalYearOf(new Date().getMonth(), new Date().getFullYear()),
+      entityLabel: "Plan",
+      records: [],
+      dailyRows: [],
+      usage: [],
+      osSplit: [],
+      plan,
+      callVolume: {},
+      warnings
+    };
+  });
+}
+
+/**
+ * Reads a planned-NPS workbook. Two layouts are accepted:
+ *
+ *   wide  - month names across a row, values on the row(s) beneath
+ *   long  - a "month" column and a "plan" column, one row per month
+ *
+ * Neither layout needs a year: bare month names are positioned in the fiscal
+ * year instead. Fuel comes from a label in the sheet, else the file name, else
+ * the page the file was dropped on.
+ */
+export function parsePlanWorkbook(
+  fileName: string,
+  data: ArrayBuffer,
+  defaultFuel: FuelType = "ICE"
+): ParsedWorkbook[] {
+  const workbook = XLSX.read(data, { type: "array", cellFormula: false });
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) throw new Error("Plan workbook has no sheets.");
+
+  const grid = sheetToGrid(workbook.Sheets[sheetName]);
+  if (grid.length === 0) throw new Error("Plan sheet is empty.");
+
+  const fuelFromName = /\bev\b/i.test(fileName)
+    ? "EV"
+    : /\bice\b/i.test(fileName)
+      ? "ICE"
+      : null;
+
+  const byFuel = new Map<FuelType, PlanRecord[]>();
+  const add = (fuel: FuelType, record: PlanRecord) => {
+    const rows = byFuel.get(fuel) ?? [];
+    rows.push(record);
+    byFuel.set(fuel, rows);
+  };
+
+  // Long layout: an explicit "month" header.
+  const headerRow = grid.findIndex((row) =>
+    (row ?? []).some((cell) => /^month$|^period$/i.test(String(cell).trim()))
+  );
+
+  if (headerRow !== -1) {
+    const header = (grid[headerRow] ?? []).map((cell) =>
+      String(cell).trim().toLowerCase()
+    );
+    const monthColumn = header.findIndex((cell) => /^month$|^period$/.test(cell));
+    const planColumn = header.findIndex((cell) =>
+      /plan|target|budget|goal/.test(cell)
+    );
+    const fuelColumn = header.findIndex((cell) => /fuel|category|type/.test(cell));
+    if (planColumn === -1) {
+      throw new Error('Plan sheet has a "month" column but no "plan" column.');
+    }
+
+    for (let index = headerRow + 1; index < grid.length; index += 1) {
+      const row = grid[index] ?? [];
+      const plan = toNumber(row[planColumn]);
+      if (plan === null) continue;
+
+      const label = String(row[monthColumn] ?? "");
+      const month = parsePlanMonth(label);
+      const fiscalMonthIndex = month ? null : fiscalMonthIndexOf(label);
+      if (!month && fiscalMonthIndex === null) continue;
+
+      const rawFuel = fuelColumn === -1 ? "" : String(row[fuelColumn] ?? "");
+      const fuel: FuelType = /\bev\b/i.test(rawFuel)
+        ? "EV"
+        : /\bice\b/i.test(rawFuel)
+          ? "ICE"
+          : (fuelFromName ?? defaultFuel);
+
+      add(fuel, { fuel, month, fiscalMonthIndex, plan });
+    }
+  } else {
+    // Wide layout: find the row holding at least three month names.
+    const monthRowIndex = grid.findIndex(
+      (row) =>
+        (row ?? []).filter(
+          (cell) =>
+            parsePlanMonth(String(cell)) !== null ||
+            fiscalMonthIndexOf(String(cell)) !== null
+        ).length >= 3
+    );
+    if (monthRowIndex === -1) {
+      throw new Error(
+        "Plan file not recognised - expected month names across a row, or a month/plan column pair."
+      );
+    }
+
+    const monthRow = grid[monthRowIndex] ?? [];
+    for (let index = monthRowIndex + 1; index < grid.length; index += 1) {
+      const row = grid[index] ?? [];
+      if (row.every((cell) => toNumber(cell) === null)) continue;
+
+      // A leading text cell may name the fuel this row of values belongs to.
+      const leading = String(row[0] ?? "");
+      const rowFuel: FuelType = /\bev\b/i.test(leading)
+        ? "EV"
+        : /\bice\b/i.test(leading)
+          ? "ICE"
+          : (fuelFromName ?? defaultFuel);
+
+      monthRow.forEach((cell, column) => {
+        const label = String(cell);
+        const month = parsePlanMonth(label);
+        const fiscalMonthIndex = month ? null : fiscalMonthIndexOf(label);
+        if (!month && fiscalMonthIndex === null) return;
+
+        const plan = toNumber(row[column]);
+        if (plan === null) return;
+
+        add(rowFuel, { fuel: rowFuel, month, fiscalMonthIndex, plan });
+      });
+    }
+  }
+
+  if (byFuel.size === 0) {
+    throw new Error("No usable planned values found in the plan file.");
+  }
+
+  return [...byFuel.entries()].map(([fuel, plan]) => {
+    const fiscalYears = plan
+      .filter((row): row is PlanRecord & { month: string } => row.month !== null)
+      .map((row) => {
+        const [year, month] = row.month.split("-").map(Number);
+        return fiscalYearOf(month - 1, year);
+      });
+
+    return {
+      fileName: byFuel.size > 1 ? `${fileName} (${fuel})` : fileName,
+      fuel,
+      fiscalYear:
+        fiscalYears.length > 0
+          ? Math.max(...fiscalYears)
+          : fiscalYearOf(new Date().getMonth(), new Date().getFullYear()),
+      entityLabel: "Plan",
+      records: [],
+      dailyRows: [],
+      usage: [],
+      osSplit: [],
+      plan,
+      callVolume: {},
+      warnings: []
+    };
+  });
+}
+
 export function parseNpsWorkbook(
   fileName: string,
   data: ArrayBuffer
@@ -692,9 +1064,11 @@ export function parseNpsWorkbook(
     const value = name.trim().toLowerCase();
     return value === "input" || value === "input sheet";
   });
-  const dailyRows = inputSheet
-    ? parseDailyRows(sheetToGrid(inputSheet.sheet), fuel, warnings)
+  const inputGrid = inputSheet ? sheetToGrid(inputSheet.sheet) : null;
+  const dailyRows = inputGrid
+    ? parseDailyRows(inputGrid, fuel, warnings)
     : [];
+  const osSplit = inputGrid ? parseOsSplit(inputGrid, fuel) : [];
 
   if (inputSheet && dailyRows.length === 0) {
     warnings.push(
@@ -740,6 +1114,8 @@ export function parseNpsWorkbook(
     records,
     dailyRows,
     usage,
+    osSplit,
+    plan: [],
     callVolume,
     warnings
   };

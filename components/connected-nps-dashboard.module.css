@@ -549,3 +549,52 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* Per-card month picker, sitting in the card header beside the title. */
+.monthSelect {
+  padding: 0.2rem 0.45rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  background: #ffffff;
+  color: #33415c;
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+/* A single card centred on its own row, matching the weekly table band. */
+.centerBand {
+  display: flex;
+  justify-content: center;
+}
+
+.centerBand > section {
+  width: 100%;
+  max-width: 900px;
+}
+
+.legendActual::before {
+  background: #1f9d55 !important;
+}
+
+.legendPlan::before {
+  background: #1d4ed8 !important;
+}
+
+/* Pies keep a modest fixed size instead of stretching to the card width. */
+.pieSvg {
+  display: block;
+  width: 100%;
+  max-width: 560px;
+  height: auto;
+  margin: 0 auto;
+  overflow: visible;
+}
+
+.legendPassive::before {
+  background: #f2b705 !important;
+}
+
+.legendDetractor::before {
+  background: #e02b20 !important;
+}

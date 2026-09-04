@@ -56,9 +56,19 @@ export type DashboardModel = {
   currentMonthLabel: string;
   selectedMonthSample: number;
   selectedMonthLabel: string;
-  /** Promoter % and Passive % cards, same shape as the NPS chart. */
+  /** Planned NPS for the current fiscal year, from the plan CSV. */
+  planMonths: MonthPoint[];
+  planAvailable: boolean;
+  /** Promoter %, Passive % and Detractor % cards, same shape as the NPS chart. */
   promoterPct: MetricSeries;
   passivePct: MetricSeries;
+  detractorPct: MetricSeries;
+  /** Per-month splits behind the "Stratification Of Customers" pies. */
+  categoryByMonth: Record<string, CategorySplit>;
+  osByMonth: Record<string, OsSplit>;
+  /** Months each pie has data for, oldest first. */
+  categoryMonths: string[];
+  osMonths: string[];
   sampleTrend: SamplePoint[];
   weeks: WeekPoint[];
   monthOptions: string[];
@@ -69,6 +79,16 @@ export type DashboardModel = {
   weeksFromDailyRows: boolean;
   warnings: string[];
 };
+
+export type CategorySplit = {
+  promoters: number;
+  passives: number;
+  detractors: number;
+  total: number;
+};
+
+/** Phone platform mix; total is android + ios, ignoring uncaptured rows. */
+export type OsSplit = { android: number; ios: number; total: number };
 
 const EMPTY_SERIES: MetricSeries = {
   fyBars: [],
@@ -107,6 +127,12 @@ export function npsOf(rows: { promoters: number; detractors: number; total: numb
   const promoters = rows.reduce((sum, row) => sum + row.promoters, 0);
   const detractors = rows.reduce((sum, row) => sum + row.detractors, 0);
   return ((promoters - detractors) / total) * 100;
+}
+
+/** Fiscal year that a "YYYY-MM" key belongs to. */
+function fiscalYearOfMonth(month: string) {
+  const [year, monthNumber] = month.split("-").map(Number);
+  return monthNumber - 1 >= 3 ? year : year - 1;
 }
 
 function monthKeyFor(fiscalYear: number, monthIndex: number) {
@@ -153,7 +179,8 @@ function shareOf(field: "promoters" | "passives" | "detractors"): Aggregate {
 export const AGGREGATES = {
   nps: ((rows) => npsOf(rows)) as Aggregate,
   promoterPct: shareOf("promoters"),
-  passivePct: shareOf("passives")
+  passivePct: shareOf("passives"),
+  detractorPct: shareOf("detractors")
 };
 
 function buildMonthSeries(
@@ -282,8 +309,8 @@ export function buildDashboardModel(
   workbooks: ParsedWorkbook[],
   filters: NpsFilters = DEFAULT_FILTERS
 ): DashboardModel {
-  const allRecords = workbooks.flatMap((workbook) => workbook.records);
-  const allDaily = workbooks.flatMap((workbook) => workbook.dailyRows);
+  const allRecords = workbooks.flatMap((workbook) => workbook.records ?? []);
+  const allDaily = workbooks.flatMap((workbook) => workbook.dailyRows ?? []);
   const warnings = workbooks.flatMap((workbook) =>
     workbook.warnings.map((warning) => `${workbook.fileName}: ${warning}`)
   );
@@ -300,8 +327,15 @@ export function buildDashboardModel(
     currentMonthLabel: "",
     selectedMonthSample: 0,
     selectedMonthLabel: "",
+    planMonths: [],
+    planAvailable: false,
     promoterPct: EMPTY_SERIES,
     passivePct: EMPTY_SERIES,
+    detractorPct: EMPTY_SERIES,
+    categoryByMonth: {},
+    osByMonth: {},
+    categoryMonths: [],
+    osMonths: [],
     sampleTrend: [],
     weeks: [],
     monthOptions: [],
@@ -313,7 +347,7 @@ export function buildDashboardModel(
     warnings
   };
 
-  const allUsage = workbooks.flatMap((workbook) => workbook.usage);
+  const allUsage = workbooks.flatMap((workbook) => workbook.usage ?? []);
   if (allRecords.length === 0 && allUsage.length === 0) return empty;
 
   // Filter options come from the full data set so they never disappear as the
@@ -331,7 +365,7 @@ export function buildDashboardModel(
   const records = allRecords.filter((row) => matchesFilters(row, filters));
   const daily = allDaily.filter((row) => matchesFilters(row, filters));
   const usage = workbooks
-    .flatMap((workbook) => workbook.usage)
+    .flatMap((workbook) => workbook.usage ?? [])
     .filter((row) => matchesFilters(row, filters));
 
   const monthOptions = uniqueSorted(records.map((row) => row.month)).sort();
@@ -347,9 +381,75 @@ export function buildDashboardModel(
     ...records.map((row) => row.fiscalYear),
     ...usageFiscalYears
   );
+  // The plan is a fuel-level target, so it follows the Category filter but not
+  // Model/Variant - narrowing to one model does not change what was planned.
+  const planRows = workbooks
+    .flatMap((workbook) => workbook.plan ?? [])
+    .filter((row) => filters.fuel === "All" || row.fuel === filters.fuel);
+
+  // A plan row either names its month exactly, or gives only a position in the
+  // fiscal year - the latter is resolved against the year being displayed.
+  const planByMonth = new Map<string, number>();
+  const planByPosition = new Map<number, number>();
+  planRows.forEach((row) => {
+    if (row.month) planByMonth.set(row.month, row.plan);
+    else if (row.fiscalMonthIndex !== null)
+      planByPosition.set(row.fiscalMonthIndex, row.plan);
+  });
+
+  const planMonths: MonthPoint[] = FISCAL_MONTH_ORDER.map(
+    (monthIndex, position) => {
+      const key = monthKeyFor(fiscalYear, monthIndex);
+      const value = planByMonth.get(key) ?? planByPosition.get(position);
+      return {
+        month: key,
+        label: formatMonthKey(key).split("-")[0],
+        nps: value ?? null,
+        total: 0
+      };
+    }
+  );
+
   const npsSeries = buildSeries(records, fiscalYear, AGGREGATES.nps);
   const promoterPct = buildSeries(records, fiscalYear, AGGREGATES.promoterPct);
   const passivePct = buildSeries(records, fiscalYear, AGGREGATES.passivePct);
+  const detractorPct = buildSeries(records, fiscalYear, AGGREGATES.detractorPct);
+
+  // The pies are read month by month, each with its own selector, so both are
+  // bucketed by month rather than collapsed to a fiscal-year total.
+  const categoryByMonth: Record<string, CategorySplit> = {};
+  records.forEach((row) => {
+    const bucket = categoryByMonth[row.month] ?? {
+      promoters: 0,
+      passives: 0,
+      detractors: 0,
+      total: 0
+    };
+    bucket.promoters += row.promoters;
+    bucket.passives += row.passives;
+    bucket.detractors += row.detractors;
+    bucket.total += row.total;
+    categoryByMonth[row.month] = bucket;
+  });
+
+  const osByMonth: Record<string, OsSplit> = {};
+  workbooks
+    .flatMap((workbook) => workbook.osSplit ?? [])
+    .filter((row) => matchesFilters(row, filters))
+    .forEach((row) => {
+      const bucket = osByMonth[row.month] ?? { android: 0, ios: 0, total: 0 };
+      if (row.os === "android") bucket.android += row.count;
+      else bucket.ios += row.count;
+      bucket.total += row.count;
+      osByMonth[row.month] = bucket;
+    });
+
+  const categoryMonths = Object.keys(categoryByMonth)
+    .filter((month) => categoryByMonth[month].total > 0)
+    .sort();
+  const osMonths = Object.keys(osByMonth)
+    .filter((month) => osByMonth[month].total > 0)
+    .sort();
 
   const { fyBars, currentMonths, previousMonths, ytd } = npsSeries;
 
@@ -471,8 +571,15 @@ export function buildDashboardModel(
     currentMonthLabel: latestMonth ? formatMonthKey(latestMonth) : "",
     selectedMonthSample: selectedMonth ? totalFor(selectedMonth) : 0,
     selectedMonthLabel: selectedMonth ? formatMonthKey(selectedMonth) : "",
+    planMonths,
+    planAvailable: planMonths.some((point) => point.nps !== null),
     promoterPct,
     passivePct,
+    detractorPct,
+    categoryByMonth,
+    osByMonth,
+    categoryMonths,
+    osMonths,
     sampleTrend,
     weeks,
     monthOptions: monthsWithData,

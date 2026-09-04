@@ -6,7 +6,7 @@ import type { ParsedWorkbook } from "@/lib/nps-excel";
 // change can never resurrect stale or mis-parsed numbers.
 
 const STORAGE_KEY = "connected-nps:workbooks";
-const STORAGE_VERSION = 2;
+const STORAGE_VERSION = 5;
 
 type StoredPayload = {
   version: number;
@@ -42,7 +42,9 @@ function isWorkbook(value: unknown): value is ParsedWorkbook {
     typeof candidate.fiscalYear === "number" &&
     Array.isArray(candidate.records) &&
     Array.isArray(candidate.dailyRows) &&
-    Array.isArray(candidate.usage)
+    Array.isArray(candidate.usage) &&
+    Array.isArray(candidate.osSplit) &&
+    Array.isArray(candidate.plan)
   );
 }
 
