@@ -41,6 +41,15 @@ const JOB_TEMP_DIR = path.join(tmpdir(), "voice-to-insight-audio-jobs");
 const DEFAULT_WORKER_CONCURRENCY = 2;
 const MAX_WORKER_CONCURRENCY = 4;
 const DEFAULT_RETENTION_HOURS = 24;
+// A worker slot is claimed before runJob starts and released in its
+// .finally(), so anything that can hang forever inside a job (a request that
+// never returns, an ffmpeg child process that never exits) permanently costs
+// one slot. Lose as many slots as the concurrency limit and the queue wedges:
+// every later upload sits in "queued" for the life of the container, because
+// drainQueue can never satisfy activeCount < workerConcurrency again. These
+// timeouts exist so a job always settles and always gives its slot back.
+const DEFAULT_JOB_TIMEOUT_MINUTES = 20;
+const METRIC_WRITE_TIMEOUT_MS = 15_000;
 
 declare global {
   // eslint-disable-next-line no-var
@@ -86,6 +95,71 @@ function getRetentionMs() {
       : DEFAULT_RETENTION_HOURS;
 
   return retentionHours * 60 * 60 * 1000;
+}
+
+function getJobTimeoutMs() {
+  const configuredMinutes = Number(
+    process.env.AUDIO_JOB_TIMEOUT_MINUTES || String(DEFAULT_JOB_TIMEOUT_MINUTES)
+  );
+  const timeoutMinutes =
+    Number.isFinite(configuredMinutes) && configuredMinutes > 0
+      ? configuredMinutes
+      : DEFAULT_JOB_TIMEOUT_MINUTES;
+
+  return timeoutMinutes * 60 * 1000;
+}
+
+/**
+ * Rejects if the wrapped promise hasn't settled in time. It cannot cancel
+ * the underlying work — an in-flight HTTP request or ffmpeg process keeps
+ * running to its own conclusion — but that isn't the point: the point is
+ * that runJob settles, so the worker slot is released instead of being held
+ * hostage by a promise that may never resolve.
+ */
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(timeoutMessage));
+    }, timeoutMs);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
+/**
+ * Metrics are bookkeeping — they must never decide whether audio processing
+ * finishes. safeRecord* already swallows errors, but a *hang* isn't an
+ * error, and these are awaited inside runJob, so an unresponsive Cosmos
+ * write would strand the worker slot.
+ */
+async function recordMetricWithoutBlocking(
+  work: Promise<unknown>,
+  label: string
+) {
+  try {
+    await withTimeout(
+      work,
+      METRIC_WRITE_TIMEOUT_MS,
+      `Timed out after ${METRIC_WRITE_TIMEOUT_MS}ms`
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+
+    console.warn(`[audio-job-queue] ${label} did not complete: ${message}`);
+  }
 }
 
 function toSnapshot(job: AudioJobRecord): AudioJobSnapshot {
@@ -159,12 +233,18 @@ async function runJob(jobId: string) {
     error: ""
   });
 
+  const timeoutMs = getJobTimeoutMs();
+
   try {
     const audioBuffer = await readFile(job.filePath);
-    const result = await processAudioBuffer({
-      audioBuffer,
-      fileName: job.inputFileName
-    });
+    const result = await withTimeout(
+      processAudioBuffer({
+        audioBuffer,
+        fileName: job.inputFileName
+      }),
+      timeoutMs,
+      `Processing timed out after ${Math.round(timeoutMs / 60000)} minutes for ${job.inputFileName}.`
+    );
 
     updateJob(jobId, {
       status: "complete",
@@ -172,12 +252,18 @@ async function runJob(jobId: string) {
       result,
       error: ""
     });
-    await safeRecordUploadMetricEvent(
-      "success",
-      job.inputFileName,
-      result.durationSeconds
+    await recordMetricWithoutBlocking(
+      safeRecordUploadMetricEvent(
+        "success",
+        job.inputFileName,
+        result.durationSeconds
+      ),
+      `success metric for ${job.inputFileName}`
     );
-    await safeRecordDriverMetricCounts(result.driverMetrics, job.inputFileName);
+    await recordMetricWithoutBlocking(
+      safeRecordDriverMetricCounts(result.driverMetrics, job.inputFileName),
+      `driver metrics for ${job.inputFileName}`
+    );
   } catch (error) {
     if (error instanceof AudioProcessingError) {
       updateJob(jobId, {
@@ -186,7 +272,10 @@ async function runJob(jobId: string) {
         error: error.message,
         result: error.payload
       });
-      await safeRecordUploadMetricEvent("failure", job.inputFileName);
+      await recordMetricWithoutBlocking(
+        safeRecordUploadMetricEvent("failure", job.inputFileName),
+        `failure metric for ${job.inputFileName}`
+      );
       return;
     }
 
@@ -196,7 +285,10 @@ async function runJob(jobId: string) {
       error:
         error instanceof Error ? error.message : "Unexpected processing error."
     });
-    await safeRecordUploadMetricEvent("failure", job.inputFileName);
+    await recordMetricWithoutBlocking(
+      safeRecordUploadMetricEvent("failure", job.inputFileName),
+      `failure metric for ${job.inputFileName}`
+    );
   } finally {
     await removeAudioFile(job.filePath);
   }
@@ -220,9 +312,29 @@ function drainQueue() {
     }
 
     state.activeCount += 1;
-    void runJob(jobId).finally(() => {
-      state.activeCount -= 1;
+
+    let slotReleased = false;
+    const releaseSlot = () => {
+      if (slotReleased) {
+        return;
+      }
+
+      slotReleased = true;
+      // Never let a bookkeeping slip drive this negative: a negative
+      // activeCount would silently raise the real concurrency above the
+      // configured limit.
+      state.activeCount = Math.max(0, state.activeCount - 1);
       drainQueue();
+    };
+
+    void runJob(jobId).then(releaseSlot, (error) => {
+      // runJob handles its own failures; reaching here means something threw
+      // outside that handling, and the slot still has to come back.
+      console.error(
+        `[audio-job-queue] job ${jobId} rejected unexpectedly:`,
+        error instanceof Error ? error.message : error
+      );
+      releaseSlot();
     });
   }
 }
@@ -250,6 +362,12 @@ export async function enqueueAudioProcessingJob(params: {
   await writeFile(filePath, params.audioBuffer);
   state.jobs.set(jobId, job);
   state.queue.push(jobId);
+  // Queue depth and slot usage make a wedged worker pool obvious from the
+  // logs alone — the symptom otherwise looks like "uploads stay queued
+  // forever" with nothing explaining why.
+  console.info(
+    `[audio-job-queue] queued ${params.fileName} — ${state.queue.length} waiting, ${state.activeCount}/${getWorkerConcurrency()} slots busy`
+  );
   drainQueue();
 
   return toSnapshot(job);
