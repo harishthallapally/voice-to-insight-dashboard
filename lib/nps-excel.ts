@@ -41,6 +41,12 @@ export type DailyRow = {
   status: NpsStatus;
   entity: string;
   count: number;
+  /**
+   * Which sheet the responses came from. The monthly NPS Dashboard "Raw" tab
+   * is a later, fuller snapshot than the Integrated "Input" sheet, so where
+   * both cover a month the Raw one is used and the Input one ignored.
+   */
+  source: "input" | "raw";
 };
 
 /**
@@ -475,6 +481,20 @@ function parseOsSplit(grid: Grid, fuel: FuelType): OsRecord[] {
   return [...buckets.values()];
 }
 
+/**
+ * NPS buckets from the raw 0-10 rating: 9-10 promoter, 7-8 passive, 0-6
+ * detractor. This is the definition the report's own UOM labels quote, and it
+ * is available in every workbook - unlike the NPS Status column, which the EV
+ * previous-year file omits entirely.
+ */
+function classifyScore(raw: unknown): NpsStatus | null {
+  const value = toNumber(raw);
+  if (value === null || value < 0 || value > 10) return null;
+  if (value >= 9) return "promoter";
+  if (value >= 7) return "passive";
+  return "detractor";
+}
+
 /** Statuses appear both plural ("Promoters") and singular ("Promoter"). */
 function classifyStatus(raw: unknown): NpsStatus | null {
   if (typeof raw !== "string") return null;
@@ -527,7 +547,8 @@ function headerIndexOf(header: unknown[], predicate: (value: string) => boolean)
 function parseDailyRows(
   grid: Grid,
   fuel: FuelType,
-  warnings: string[]
+  warnings: string[],
+  source: "input" | "raw" = "input"
 ): DailyRow[] {
   if (grid.length < 2) return [];
 
@@ -536,7 +557,18 @@ function parseDailyRows(
   const statusColumn = headerIndexOf(header, (value) =>
     value.includes("nps status")
   );
-  if (dateColumn === -1 || statusColumn === -1) return [];
+  // The rating column is named "Score" in the current-year books and spelled
+  // out as a question in the previous-year ones and on the Raw tab.
+  const scoreColumn = headerIndexOf(
+    header,
+    (value) =>
+      value === "score" ||
+      value.includes("how likely are you to recommend") ||
+      value.startsWith("connected nps")
+  );
+  if (dateColumn === -1 || (scoreColumn === -1 && statusColumn === -1)) {
+    return [];
+  }
 
   const monthColumn = headerIndexOf(header, (value) => value === "month");
 
@@ -557,7 +589,11 @@ function parseDailyRows(
 
   for (let index = 1; index < grid.length; index += 1) {
     const row = grid[index] ?? [];
-    const status = classifyStatus(row[statusColumn]);
+    // Prefer the rating; fall back to the pre-labelled status where a file
+    // has no score column.
+    const status =
+      (scoreColumn === -1 ? null : classifyScore(row[scoreColumn])) ??
+      (statusColumn === -1 ? null : classifyStatus(row[statusColumn]));
     if (!status) continue;
 
     const date = parseRowDate(row[dateColumn]);
@@ -585,7 +621,15 @@ function parseDailyRows(
 
     const existing = rows.get(bucketKey);
     if (existing) existing.count += 1;
-    else rows.set(bucketKey, { fuel, date: dateKey, status, entity, count: 1 });
+    else
+      rows.set(bucketKey, {
+        fuel,
+        date: dateKey,
+        status,
+        entity,
+        count: 1,
+        source
+      });
   }
 
   if (mismatched > 0) {
@@ -1059,6 +1103,9 @@ export function parseNpsWorkbook(
   }
 
   const usage = rawGrid ? parseRawUsage(rawGrid, fuel, warnings) : [];
+  const rawResponses = rawGrid
+    ? parseDailyRows(rawGrid, fuel, warnings, "raw")
+    : [];
 
   const inputSheet = findSheet(workbook, (name) => {
     const value = name.trim().toLowerCase();
@@ -1106,13 +1153,29 @@ export function parseNpsWorkbook(
     );
   }
 
+  // A workbook covers one fiscal year. Response rows dated outside it are
+  // data-entry errors - the previous-year ICE book carries a handful stamped
+  // Sep/Oct/Dec 2026 - and would otherwise invent months on the trend and
+  // hijack "current month".
+  const allResponses = [...dailyRows, ...rawResponses];
+  const inYear = allResponses.filter((row) => {
+    const [year, month] = row.date.split("-").map(Number);
+    return fiscalYearOf(month - 1, year) === fiscalYear;
+  });
+  const strays = allResponses.length - inYear.length;
+  if (strays > 0) {
+    warnings.push(
+      `${strays} response row(s) fell outside FY ${formatFiscalYear(fiscalYear)} and were excluded.`
+    );
+  }
+
   return {
     fileName,
     fuel,
     fiscalYear,
     entityLabel,
     records,
-    dailyRows,
+    dailyRows: inYear,
     usage,
     osSplit,
     plan: [],

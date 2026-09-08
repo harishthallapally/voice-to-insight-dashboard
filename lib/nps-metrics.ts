@@ -1,4 +1,5 @@
 import {
+  fiscalYearOf,
   formatFiscalYear,
   formatMonthKey,
   type DailyRow,
@@ -355,15 +356,55 @@ export function buildDashboardModel(
   // is usable on its own.
   const subcategoryOptions = uniqueEntities(
     allRecords.filter((row) => row.fuel === "ICE"),
-    allUsage.filter((row) => row.fuel === "ICE")
+    [...allUsage, ...allDaily].filter((row) => row.fuel === "ICE")
   );
   const variantOptions = uniqueEntities(
     allRecords.filter((row) => row.fuel === "EV"),
-    allUsage.filter((row) => row.fuel === "EV")
+    [...allUsage, ...allDaily].filter((row) => row.fuel === "EV")
   );
 
-  const records = allRecords.filter((row) => matchesFilters(row, filters));
-  const daily = allDaily.filter((row) => matchesFilters(row, filters));
+  // NPS and the share cards are computed from the response rows, not from the
+  // Summary sheet's aggregates. Where a month appears in both a monthly Raw
+  // tab and an Integrated Input sheet, the Raw one wins: it is the later
+  // snapshot and carries more responses.
+  const responseRows = allDaily.filter((row) => matchesFilters(row, filters));
+  const rawMonths = new Set(
+    responseRows
+      .filter((row) => row.source === "raw")
+      .map((row) => row.date.slice(0, 7))
+  );
+  const countedRows = responseRows.filter(
+    (row) => row.source === "raw" || !rawMonths.has(row.date.slice(0, 7))
+  );
+
+  const derived = new Map<string, NpsRecord>();
+  countedRows.forEach((row) => {
+    const month = row.date.slice(0, 7);
+    const key = `${row.fuel}|${month}|${row.entity}`;
+    const [year, monthNumber] = month.split("-").map(Number);
+    const record =
+      derived.get(key) ??
+      ({
+        fuel: row.fuel,
+        fiscalYear: fiscalYearOf(monthNumber - 1, year),
+        entity: row.entity,
+        month,
+        promoters: 0,
+        passives: 0,
+        detractors: 0,
+        total: 0
+      } as NpsRecord);
+
+    if (row.status === "promoter") record.promoters += row.count;
+    else if (row.status === "passive") record.passives += row.count;
+    else record.detractors += row.count;
+    record.total += row.count;
+
+    derived.set(key, record);
+  });
+
+  const records = [...derived.values()];
+  const daily = countedRows;
   const usage = workbooks
     .flatMap((workbook) => workbook.usage ?? [])
     .filter((row) => matchesFilters(row, filters));

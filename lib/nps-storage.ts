@@ -6,7 +6,7 @@ import type { ParsedWorkbook } from "@/lib/nps-excel";
 // change can never resurrect stale or mis-parsed numbers.
 
 const STORAGE_KEY = "connected-nps:workbooks";
-const STORAGE_VERSION = 5;
+const STORAGE_VERSION = 6;
 
 type StoredPayload = {
   version: number;
