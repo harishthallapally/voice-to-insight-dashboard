@@ -181,23 +181,6 @@ function downloadWorkbook(fileName: string, workbookBase64: string) {
   URL.revokeObjectURL(url);
 }
 
-function downloadAllWorkbooks(items: UploadItem[]) {
-  const downloadableItems = items.filter(
-    (item) => item.result?.fileName && item.result.workbookBase64
-  );
-
-  if (!downloadableItems.length) {
-    throw new Error("No Excel files are available to download.");
-  }
-
-  downloadableItems.forEach((item) => {
-    downloadWorkbook(
-      item.result?.fileName || "conversation-data.xlsx",
-      item.result?.workbookBase64 || ""
-    );
-  });
-}
-
 function getCellText(row: ConversationDataRow, columnName: string) {
   const value = row[columnName];
 
@@ -239,6 +222,113 @@ function getRatingColumn(row: ConversationDataRow) {
   }
 
   return "";
+}
+
+/**
+ * Each call works through three questions in a fixed order — vehicle, then
+ * connected features, then charger — and the client wants one consolidated
+ * workbook per question.
+ */
+type QuestionCategory = "vehicle" | "connected" | "charger";
+
+const questionCategoryOrder: QuestionCategory[] = [
+  "vehicle",
+  "connected",
+  "charger"
+];
+
+const questionCategoryLabels: Record<QuestionCategory, string> = {
+  vehicle: "Vehicle",
+  connected: "Connected Features",
+  charger: "Charger"
+};
+
+/**
+ * Which workbook carries the per-file Summary. The Summary sits on the
+ * file's first row, which classifies as "vehicle" on its own, but the team
+ * works out of the connected-features workbook — so that row is routed here
+ * instead.
+ */
+const summaryQuestionCategory: QuestionCategory = "connected";
+
+const questionCategoryFileNames: Record<QuestionCategory, string> = {
+  vehicle: "consolidated-vehicle.xlsx",
+  connected: "consolidated-connected-features.xlsx",
+  charger: "consolidated-charger.xlsx"
+};
+
+/**
+ * Keyword match for a single row. "4j" / "4th day" are in the charger
+ * pattern deliberately: on 8kHz call audio Whisper reliably mishears
+ * "charger" as those, and without them the entire charger section of a call
+ * goes unrecognised — a real client file classified 0 rows as charger while
+ * plainly containing a charger question the customer answered.
+ */
+function detectQuestionCategory(
+  row: ConversationDataRow
+): QuestionCategory | null {
+  const rowContext = [
+    getCellText(row, "Topic"),
+    getCellText(row, "Notes"),
+    getCellText(row, "L3 Driver"),
+    getCellText(row, "Transcription")
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  if (/\b(charger|charging|charge|4\s*j|4th\s+day|fourth\s+day)\b/.test(rowContext)) {
+    return "charger";
+  }
+
+  if (
+    /\b(connected|connectivity|mobile app|mobile application|app|maps?|bluetooth|navigation|gps|phone|pairing|telematics|smartxconnect|smart xonnect)\b/.test(
+      rowContext
+    )
+  ) {
+    return "connected";
+  }
+
+  if (
+    /\b(product|vehicle|two wheeler|bike|scooter|overall|ride|motor|performance|brake|battery|range)\b/.test(
+      rowContext
+    )
+  ) {
+    return "vehicle";
+  }
+
+  return null;
+}
+
+/**
+ * Assigns every row to a question, walking the call in order. Keywords alone
+ * are not enough: plenty of rows carry no category word at all ("Rating
+ * Given", "Consent to Continue"), and a stray "app" mention inside the
+ * charger section would otherwise drag those rows back into connected
+ * features. So a detected category can only ever move the call *forward*
+ * through the three questions, and rows without a keyword inherit whichever
+ * question is currently open.
+ *
+ * Must be given every row of the file, not the filtered subset — the rows
+ * that mark a transition are often the ones filtering would drop.
+ */
+function assignQuestionCategories(
+  rows: ConversationDataRow[]
+): QuestionCategory[] {
+  let currentCategory: QuestionCategory = "vehicle";
+
+  return rows.map((row) => {
+    const detectedCategory = detectQuestionCategory(row);
+
+    if (
+      detectedCategory &&
+      questionCategoryOrder.indexOf(detectedCategory) >
+        questionCategoryOrder.indexOf(currentCategory)
+    ) {
+      currentCategory = detectedCategory;
+    }
+
+    return currentCategory;
+  });
 }
 
 function getDriverAndRatingValues(row: ConversationDataRow) {
@@ -371,14 +461,31 @@ function buildWorksheetName(
   return worksheetName;
 }
 
-async function downloadConsolidatedWorkbook(items: UploadItem[]) {
-  const XLSX = await import("xlsx");
-  const consolidatedWorkbook = XLSX.utils.book_new();
-  const usedWorksheetNames = new Set<string>(["consolidated"]);
-  const consolidatedRows: ConsolidatedRow[] = [];
-  let worksheetCount = 0;
+type CategoryWorkbookContent = {
+  consolidatedRows: ConsolidatedRow[];
+  fileSheets: Array<{ inputFileName: string; rows: ConversationDataRow[] }>;
+};
 
-  for (const [index, item] of items.entries()) {
+const COMBINED_CONSOLIDATED_FILE_NAME = "consolidated-conversation-data.xlsx";
+
+/**
+ * Builds a consolidated workbook: a "Consolidated" sheet first, then one tab
+ * per audio file. Passing a category narrows it to a single question so the
+ * client can take just the one they care about; passing null keeps every
+ * question in one workbook, which is the original combined download.
+ */
+async function downloadConsolidatedWorkbook(
+  items: UploadItem[],
+  category: QuestionCategory | null
+) {
+  const XLSX = await import("xlsx");
+  const content: CategoryWorkbookContent = {
+    consolidatedRows: [],
+    fileSheets: []
+  };
+  let processedFileCount = 0;
+
+  for (const item of items) {
     const workbookBase64 = item.result?.workbookBase64;
 
     if (!workbookBase64) {
@@ -396,51 +503,75 @@ async function downloadConsolidatedWorkbook(items: UploadItem[]) {
       );
     }
 
-    const sheetRows = XLSX.utils.sheet_to_json<ConversationDataRow>(
-      worksheet,
-      {
-        defval: ""
-      }
-    );
-    const filteredSheetRows = buildFilteredConversationRows(sheetRows);
+    const sheetRows = XLSX.utils.sheet_to_json<ConversationDataRow>(worksheet, {
+      defval: ""
+    });
 
-    consolidatedRows.push(
+    processedFileCount += 1;
+
+    let rowsForWorkbook = sheetRows;
+
+    if (category) {
+      // Categories are assigned across the whole file before any filtering,
+      // because the rows that mark a move from one question to the next are
+      // frequently ones the filter drops.
+      const rowCategories = assignQuestionCategories(sheetRows);
+
+      // Keep the Summary row itself intact (greeting text and all) and simply
+      // move it to the workbook the team actually reads.
+      sheetRows.forEach((row, rowIndex) => {
+        if (getCellText(row, "Summary")) {
+          rowCategories[rowIndex] = summaryQuestionCategory;
+        }
+      });
+
+      rowsForWorkbook = sheetRows.filter(
+        (_row, rowIndex) => rowCategories[rowIndex] === category
+      );
+    }
+
+    const filteredRows = buildFilteredConversationRows(rowsForWorkbook);
+
+    if (!filteredRows.length) {
+      continue;
+    }
+
+    content.consolidatedRows.push(
       ...buildConsolidatedRows({
         frameNo: stripFileExtension(item.inputFileName) || item.inputFileName,
-        rows: filteredSheetRows,
-        startIndex: consolidatedRows.length + 1
+        rows: filteredRows,
+        startIndex: content.consolidatedRows.length + 1
       })
     );
-
-    XLSX.utils.book_append_sheet(
-      consolidatedWorkbook,
-      buildConversationWorksheet(XLSX, filteredSheetRows),
-      buildWorksheetName(item.inputFileName, index, usedWorksheetNames)
-    );
-    worksheetCount += 1;
+    content.fileSheets.push({
+      inputFileName: item.inputFileName,
+      rows: filteredRows
+    });
   }
 
-  if (!worksheetCount) {
+  if (!processedFileCount) {
     throw new Error("No Conversation Data sheets are available to consolidate.");
   }
 
-  const consolidatedWorksheet = buildConsolidatedWorksheet(
-    XLSX,
-    consolidatedRows
-  );
+  const categoryWorkbook = XLSX.utils.book_new();
+
   XLSX.utils.book_append_sheet(
-    consolidatedWorkbook,
-    consolidatedWorksheet,
+    categoryWorkbook,
+    buildConsolidatedWorksheet(XLSX, content.consolidatedRows),
     "Consolidated"
   );
-  consolidatedWorkbook.SheetNames = [
-    "Consolidated",
-    ...consolidatedWorkbook.SheetNames.filter(
-      (sheetName) => sheetName !== "Consolidated"
-    )
-  ];
 
-  const workbookArray = XLSX.write(consolidatedWorkbook, {
+  const usedWorksheetNames = new Set<string>(["consolidated"]);
+
+  content.fileSheets.forEach((fileSheet, index) => {
+    XLSX.utils.book_append_sheet(
+      categoryWorkbook,
+      buildConversationWorksheet(XLSX, fileSheet.rows),
+      buildWorksheetName(fileSheet.inputFileName, index, usedWorksheetNames)
+    );
+  });
+
+  const workbookArray = XLSX.write(categoryWorkbook, {
     bookType: "xlsx",
     type: "array"
   });
@@ -451,7 +582,9 @@ async function downloadConsolidatedWorkbook(items: UploadItem[]) {
   const anchor = document.createElement("a");
 
   anchor.href = url;
-  anchor.download = "consolidated-conversation-data.xlsx";
+  anchor.download = category
+    ? questionCategoryFileNames[category]
+    : COMBINED_CONSOLIDATED_FILE_NAME;
   anchor.click();
   URL.revokeObjectURL(url);
 }
@@ -551,7 +684,10 @@ export function UploadForm() {
   const [selectedFileNames, setSelectedFileNames] = useState<string[]>([]);
   const [isDragActive, setIsDragActive] = useState(false);
   const [isPreparingFiles, setIsPreparingFiles] = useState(false);
-  const [isBuildingConsolidated, setIsBuildingConsolidated] = useState(false);
+  // "all" is the combined workbook; a category is one question's workbook.
+  const [buildingDownload, setBuildingDownload] = useState<
+    QuestionCategory | "all" | null
+  >(null);
 
   const finishedCount = items.filter(
     (item) => item.status === "complete" || item.status === "error"
@@ -615,8 +751,8 @@ export function UploadForm() {
   // state (complete OR error) — not only when every file succeeded. A batch
   // upload where some files fail (e.g. credits exhausted mid-run) should
   // still let the client download Excel for whichever files did succeed,
-  // rather than blocking the buttons entirely. downloadAllWorkbooks and
-  // downloadConsolidatedWorkbook already skip failed items on their own.
+  // rather than blocking the buttons entirely. downloadConsolidatedWorkbook
+  // already skips failed items on its own.
   const allFilesFinished =
     items.length > 0 &&
     items.every((item) => item.status === "complete" || item.status === "error");
@@ -999,36 +1135,10 @@ export function UploadForm() {
                   <button
                     className="button button-secondary"
                     type="button"
-                    disabled={!isConsolidatedReady}
+                    disabled={!isConsolidatedReady || buildingDownload !== null}
                     title={
                       isConsolidatedReady
-                        ? "Download every successfully processed Excel file"
-                        : allFilesFinished
-                          ? "No files completed successfully — nothing to download"
-                          : "Available once every file has finished processing"
-                    }
-                    onClick={() => {
-                      try {
-                        setError("");
-                        downloadAllWorkbooks(items);
-                      } catch (downloadError) {
-                        setError(
-                          downloadError instanceof Error
-                            ? downloadError.message
-                            : "Could not download the Excel files."
-                        );
-                      }
-                    }}
-                  >
-                    Download All Excel
-                  </button>
-                  <button
-                    className="button button-secondary"
-                    type="button"
-                    disabled={!isConsolidatedReady || isBuildingConsolidated}
-                    title={
-                      isConsolidatedReady
-                        ? "Download one Consolidated tab plus each successfully processed file's Conversation Data tab"
+                        ? "Download one consolidated workbook covering every question"
                         : allFilesFinished
                           ? "No files completed successfully — nothing to consolidate"
                           : "Available once every file has finished processing"
@@ -1036,10 +1146,10 @@ export function UploadForm() {
                     onClick={() => {
                       void (async () => {
                         setError("");
-                        setIsBuildingConsolidated(true);
+                        setBuildingDownload("all");
 
                         try {
-                          await downloadConsolidatedWorkbook(items);
+                          await downloadConsolidatedWorkbook(items, null);
                         } catch (consolidationError) {
                           setError(
                             consolidationError instanceof Error
@@ -1047,15 +1157,52 @@ export function UploadForm() {
                               : "Could not build the consolidated Excel file."
                           );
                         } finally {
-                          setIsBuildingConsolidated(false);
+                          setBuildingDownload(null);
                         }
                       })();
                     }}
                   >
-                    {isBuildingConsolidated
+                    {buildingDownload === "all"
                       ? "Preparing..."
                       : "Download Consolidated Excel"}
                   </button>
+                  {questionCategoryOrder.map((category) => (
+                    <button
+                      key={category}
+                      className="button button-secondary"
+                      type="button"
+                      disabled={!isConsolidatedReady || buildingDownload !== null}
+                      title={
+                        isConsolidatedReady
+                          ? `Download the consolidated ${questionCategoryLabels[category]} workbook (${questionCategoryFileNames[category]})`
+                          : allFilesFinished
+                            ? "No files completed successfully — nothing to consolidate"
+                            : "Available once every file has finished processing"
+                      }
+                      onClick={() => {
+                        void (async () => {
+                          setError("");
+                          setBuildingDownload(category);
+
+                          try {
+                            await downloadConsolidatedWorkbook(items, category);
+                          } catch (consolidationError) {
+                            setError(
+                              consolidationError instanceof Error
+                                ? consolidationError.message
+                                : `Could not build the ${questionCategoryLabels[category]} Excel file.`
+                            );
+                          } finally {
+                            setBuildingDownload(null);
+                          }
+                        })();
+                      }}
+                    >
+                      {buildingDownload === category
+                        ? "Preparing..."
+                        : `${questionCategoryLabels[category]} Excel`}
+                    </button>
+                  ))}
                 </div>
               </div>
 
