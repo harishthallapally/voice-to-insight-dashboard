@@ -373,6 +373,82 @@ export async function enqueueAudioProcessingJob(params: {
   return toSnapshot(job);
 }
 
+export type AudioQueueStatus = {
+  concurrency: number;
+  activeCount: number;
+  queuedCount: number;
+  jobTimeoutMinutes: number;
+  statusCounts: Record<AudioJobStatus, number>;
+  activeJobs: Array<{
+    id: string;
+    inputFileName: string;
+    startedAt?: string;
+    ageSeconds: number;
+  }>;
+  oldestActiveAgeSeconds: number | null;
+  /**
+   * Slots counted as busy with no job actually running in them. This is the
+   * signature of the wedge that stalled the queue twice: activeCount is
+   * incremented before a job starts and decremented when it settles, so a
+   * job that never settles leaves the counter permanently high with nothing
+   * to show for it. Anything above 0 here is a leak, full stop.
+   */
+  leakedSlots: number;
+  /** Every slot claimed and work waiting behind them. */
+  saturated: boolean;
+  generatedAt: string;
+};
+
+/**
+ * Read-only snapshot of the worker pool, so "uploads are stuck in queued"
+ * can be answered directly instead of inferred from the outside. The two
+ * cases look identical to a user but need opposite responses: a healthy
+ * backlog (saturated, no leaked slots, jobs completing) just needs time,
+ * while leaked slots need a restart and a bug fix.
+ */
+export function getAudioQueueStatus(): AudioQueueStatus {
+  const state = getQueueState();
+  const concurrency = getWorkerConcurrency();
+  const now = Date.now();
+  const statusCounts: Record<AudioJobStatus, number> = {
+    queued: 0,
+    processing: 0,
+    complete: 0,
+    error: 0
+  };
+  const activeJobs: AudioQueueStatus["activeJobs"] = [];
+
+  for (const job of state.jobs.values()) {
+    statusCounts[job.status] += 1;
+
+    if (job.status === "processing") {
+      const startedAtMs = job.startedAt ? Date.parse(job.startedAt) : now;
+
+      activeJobs.push({
+        id: job.id,
+        inputFileName: job.inputFileName,
+        startedAt: job.startedAt,
+        ageSeconds: Math.max(0, Math.round((now - startedAtMs) / 1000))
+      });
+    }
+  }
+
+  activeJobs.sort((left, right) => right.ageSeconds - left.ageSeconds);
+
+  return {
+    concurrency,
+    activeCount: state.activeCount,
+    queuedCount: state.queue.length,
+    jobTimeoutMinutes: Math.round(getJobTimeoutMs() / 60000),
+    statusCounts,
+    activeJobs,
+    oldestActiveAgeSeconds: activeJobs.length ? activeJobs[0].ageSeconds : null,
+    leakedSlots: Math.max(0, state.activeCount - activeJobs.length),
+    saturated: state.activeCount >= concurrency && state.queue.length > 0,
+    generatedAt: new Date(now).toISOString()
+  };
+}
+
 export function getAudioProcessingJob(jobId: string) {
   const job = getQueueState().jobs.get(jobId);
 
