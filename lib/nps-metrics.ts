@@ -1,5 +1,6 @@
 import {
   fiscalYearOf,
+  type NpsStatus,
   formatFiscalYear,
   formatMonthKey,
   type DailyRow,
@@ -70,6 +71,9 @@ export type DashboardModel = {
   /** Months each pie has data for, oldest first. */
   categoryMonths: string[];
   osMonths: string[];
+  /** L1/L2 driver mentions per month, sorted most-mentioned first. */
+  driversByMonth: Record<string, DriverBreakdown>;
+  driverMonths: string[];
   sampleTrend: SamplePoint[];
   weeks: WeekPoint[];
   monthOptions: string[];
@@ -80,6 +84,15 @@ export type DashboardModel = {
   weeksFromDailyRows: boolean;
   warnings: string[];
 };
+
+/** One driver's share of the mentions in its bucket, for a single month. */
+export type DriverEntry = { driver: string; count: number; share: number };
+
+/** Drivers for one month, split by NPS bucket and taxonomy level. */
+export type DriverBreakdown = Record<
+  NpsStatus,
+  { l1: DriverEntry[]; l2: DriverEntry[] }
+>;
 
 export type CategorySplit = {
   promoters: number;
@@ -337,6 +350,8 @@ export function buildDashboardModel(
     osByMonth: {},
     categoryMonths: [],
     osMonths: [],
+    driversByMonth: {},
+    driverMonths: [],
     sampleTrend: [],
     weeks: [],
     monthOptions: [],
@@ -485,6 +500,49 @@ export function buildDashboardModel(
       osByMonth[row.month] = bucket;
     });
 
+  // Driver mentions, bucketed month / status / level and ranked within each.
+  const driverRows = workbooks
+    .flatMap((workbook) => workbook.drivers ?? [])
+    .filter((row) => matchesFilters(row, filters));
+
+  const driverCounts = new Map<string, Map<string, number>>();
+  driverRows.forEach((row) => {
+    const key = `${row.month}|${row.status}|${row.level}`;
+    const bucket = driverCounts.get(key) ?? new Map<string, number>();
+    bucket.set(row.driver, (bucket.get(row.driver) ?? 0) + row.count);
+    driverCounts.set(key, bucket);
+  });
+
+  const emptyBreakdown = (): DriverBreakdown => ({
+    promoter: { l1: [], l2: [] },
+    passive: { l1: [], l2: [] },
+    detractor: { l1: [], l2: [] }
+  });
+
+  const driversByMonth: Record<string, DriverBreakdown> = {};
+  driverCounts.forEach((bucket, key) => {
+    const [month, status, level] = key.split("|") as [
+      string,
+      NpsStatus,
+      "l1" | "l2"
+    ];
+    const total = [...bucket.values()].reduce((sum, value) => sum + value, 0);
+    if (total <= 0) return;
+
+    const entries = [...bucket.entries()]
+      .map(([driver, count]) => ({
+        driver,
+        count,
+        share: (count / total) * 100
+      }))
+      .sort((a, b) => b.count - a.count || a.driver.localeCompare(b.driver));
+
+    driversByMonth[month] = driversByMonth[month] ?? emptyBreakdown();
+    driversByMonth[month][status][level] = entries;
+  });
+
+  const driverMonths = Object.keys(driversByMonth).sort();
+
   const categoryMonths = Object.keys(categoryByMonth)
     .filter((month) => categoryByMonth[month].total > 0)
     .sort();
@@ -621,6 +679,8 @@ export function buildDashboardModel(
     osByMonth,
     categoryMonths,
     osMonths,
+    driversByMonth,
+    driverMonths,
     sampleTrend,
     weeks,
     monthOptions: monthsWithData,

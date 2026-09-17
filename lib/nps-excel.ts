@@ -100,6 +100,21 @@ export function fiscalMonthIndexOf(raw: string): number | null {
   return (calendarIndex + 9) % 12;
 }
 
+/**
+ * One driver mention from the per-voice sheet (IVC / "Integrated voice
+ * sheet"). A respondent may raise several voices, so these count mentions
+ * rather than customers. Both taxonomy levels are parsed together.
+ */
+export type DriverRow = {
+  fuel: FuelType;
+  month: string;
+  entity: string;
+  status: NpsStatus;
+  level: "l1" | "l2";
+  driver: string;
+  count: number;
+};
+
 export type ParsedWorkbook = {
   fileName: string;
   fuel: FuelType;
@@ -111,6 +126,7 @@ export type ParsedWorkbook = {
   usage: UsageRecord[];
   osSplit: OsRecord[];
   plan: PlanRecord[];
+  drivers: DriverRow[];
   /** Dialed / close-call counts by month key, when the workbook carries them. */
   callVolume: Record<string, { dialed?: number; closeCall?: number }>;
   warnings: string[];
@@ -760,6 +776,8 @@ function isNeededSheet(name: string) {
     value === "raw" ||
     value === "input" ||
     value === "input sheet" ||
+    value === "ivc" ||
+    value.includes("voice sheet") ||
     value.includes("customer call")
   );
 }
@@ -894,6 +912,7 @@ export function parsePlanCsv(fileName: string, text: string): ParsedWorkbook[] {
       usage: [],
       osSplit: [],
       plan,
+      drivers: [],
       callVolume: {},
       warnings
     };
@@ -1040,10 +1059,78 @@ export function parsePlanWorkbook(
       usage: [],
       osSplit: [],
       plan,
+      drivers: [],
       callVolume: {},
       warnings: []
     };
   });
+}
+
+/**
+ * Reads the per-voice sheet into driver mentions per month, model, NPS bucket
+ * and taxonomy level. The sheet is "IVC" in the current-year books and a
+ * variant of "Integrated voice sheet" in the previous-year ones - sometimes
+ * with trailing spaces - so it is matched on a trimmed name. EV's copy names
+ * months without a year, hence the fall back to the date column.
+ */
+function parseDriverRows(grid: Grid, fuel: FuelType): DriverRow[] {
+  if (grid.length < 2) return [];
+
+  const header = grid[0] ?? [];
+  const levels = (
+    [
+      { level: "l1", column: headerIndexOf(header, (v) => /^l1\s*driver/.test(v)) },
+      { level: "l2", column: headerIndexOf(header, (v) => /^l2\s*driver/.test(v)) }
+    ] as Array<{ level: "l1" | "l2"; column: number }>
+  ).filter((entry) => entry.column !== -1);
+  if (levels.length === 0) return [];
+
+  const statusColumn = headerIndexOf(header, (v) => v.includes("nps status"));
+  const scoreColumn = headerIndexOf(
+    header,
+    (v) => v === "score" || v.includes("how likely are you to recommend")
+  );
+  if (statusColumn === -1 && scoreColumn === -1) return [];
+
+  const monthColumn = headerIndexOf(header, (v) => v === "month");
+  const dateColumn = headerIndexOf(header, (v) => v === "date");
+  const modelColumn = headerIndexOf(header, (v) => v.includes("vehicle model"));
+
+  const buckets = new Map<string, DriverRow>();
+
+  for (let index = 1; index < grid.length; index += 1) {
+    const row = grid[index] ?? [];
+
+    const status =
+      (scoreColumn === -1 ? null : classifyScore(row[scoreColumn])) ??
+      (statusColumn === -1 ? null : classifyStatus(row[statusColumn]));
+    if (!status) continue;
+
+    let month = "";
+    const stated = monthColumn === -1 ? null : parseMonthLabel(row[monthColumn]);
+    if (stated) month = monthKey(stated.monthIndex, stated.year);
+    else if (dateColumn !== -1) {
+      const date = parseRowDate(row[dateColumn]);
+      if (date) month = monthKey(date.getUTCMonth(), date.getUTCFullYear());
+    }
+    if (!month) continue;
+
+    const entity =
+      modelColumn === -1 ? "" : String(row[modelColumn] ?? "").trim();
+
+    for (const { level, column } of levels) {
+      const driver = String(row[column] ?? "").trim();
+      if (!driver || driver === "-") continue;
+
+      const key = `${month}|${entity}|${status}|${level}|${driver}`;
+      const existing = buckets.get(key);
+      if (existing) existing.count += 1;
+      else
+        buckets.set(key, { fuel, month, entity, status, level, driver, count: 1 });
+    }
+  }
+
+  return [...buckets.values()];
 }
 
 export function parseNpsWorkbook(
@@ -1123,6 +1210,14 @@ export function parseNpsWorkbook(
     );
   }
 
+  const voiceSheet = findSheet(workbook, (name) => {
+    const value = name.trim().toLowerCase();
+    return value === "ivc" || value.includes("voice sheet");
+  });
+  const drivers = voiceSheet
+    ? parseDriverRows(sheetToGrid(voiceSheet.sheet), fuel)
+    : [];
+
   const callsSheet = findSheet(workbook, (name) =>
     name.toLowerCase().includes("customer call")
   );
@@ -1179,6 +1274,7 @@ export function parseNpsWorkbook(
     usage,
     osSplit,
     plan: [],
+    drivers,
     callVolume,
     warnings
   };

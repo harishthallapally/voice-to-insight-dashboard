@@ -11,6 +11,7 @@ import {
   buildDashboardModel,
   DEFAULT_FILTERS,
   type CategorySplit,
+  type DriverEntry,
   type DashboardModel,
   type FyBar,
   type MonthPoint,
@@ -127,6 +128,21 @@ const DEMO_MODEL: DashboardModel = {
   osByMonth: { "2026-08": { android: 840, ios: 140, total: 980 } },
   categoryMonths: ["2026-08"],
   osMonths: ["2026-08"],
+  driversByMonth: {
+    "2026-08": {
+      promoter: {
+        l1: [],
+        l2: [
+          { driver: "Features are useful", count: 460, share: 64.8 },
+          { driver: "Need additional features", count: 77, share: 10.8 },
+          { driver: "Call notifications are good", count: 19, share: 2.7 }
+        ]
+      },
+      passive: { l1: [], l2: [] },
+      detractor: { l1: [], l2: [] }
+    }
+  },
+  driverMonths: ["2026-08"],
   weeks: [
     { label: "21-Jun", nps: 52.2, total: 0 },
     { label: "28-Jun", nps: 50.6, total: 0 },
@@ -881,6 +897,115 @@ function StackedTrendChart({
   );
 }
 
+/**
+ * Ranked driver bars, as on the source report: one bar per driver, tallest
+ * first, labelled with its share of that bucket's mentions.
+ */
+function DriverBarChart({
+  entries,
+  ariaLabel
+}: {
+  entries: DriverEntry[];
+  ariaLabel: string;
+}) {
+  const width = 1180;
+  const height = 300;
+  const left = 52;
+  const right = 16;
+  const top = 22;
+  const bottom = 104;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
+
+  if (entries.length === 0) {
+    return <p className={styles.emptyNote}>No driver mentions for this selection.</p>;
+  }
+
+  const maxShare = Math.max(...entries.map((entry) => entry.share));
+  // Round the axis up to a clean step so the tallest bar never touches the top.
+  const step = maxShare > 50 ? 20 : maxShare > 20 ? 10 : 5;
+  const bound = Math.max(step, Math.ceil(maxShare / step) * step);
+
+  const slot = plotWidth / entries.length;
+  const barWidth = Math.min(slot * 0.62, 64);
+  const getY = (share: number) => top + (1 - share / bound) * plotHeight;
+
+  const ticks: number[] = [];
+  for (let tick = 0; tick <= bound; tick += step) ticks.push(tick);
+
+  return (
+    <svg
+      className={styles.chartSvg}
+      viewBox={`0 0 ${width} ${height}`}
+      role="img"
+      aria-label={ariaLabel}
+    >
+      {ticks.map((tick) => (
+        <g key={tick}>
+          <line
+            x1={left}
+            x2={width - right}
+            y1={getY(tick)}
+            y2={getY(tick)}
+            stroke="#e2e8f0"
+            strokeWidth={1}
+          />
+          <text
+            x={left - 10}
+            y={getY(tick) + 4}
+            fontSize={12}
+            fill="#5a6b82"
+            textAnchor="end"
+          >
+            {`${tick}%`}
+          </text>
+        </g>
+      ))}
+
+      {entries.map((entry, index) => {
+        const centre = left + slot * index + slot / 2;
+        const barHeight = (entry.share / bound) * plotHeight;
+        const y = getY(entry.share);
+
+        return (
+          <g key={entry.driver}>
+            <rect
+              x={centre - barWidth / 2}
+              y={y}
+              width={barWidth}
+              height={Math.max(barHeight, 1)}
+              fill="#1f8ef1"
+            />
+            <text
+              x={centre}
+              y={y - 6}
+              fontSize={12}
+              fontWeight={700}
+              fill="#334155"
+              textAnchor="middle"
+            >
+              {`${Math.round(entry.share)}%`}
+            </text>
+            {/* Driver names are long, so they run vertically under the bar. */}
+            <text
+              x={centre}
+              y={height - bottom + 10}
+              fontSize={11}
+              fill="#475569"
+              textAnchor="end"
+              transform={`rotate(-90 ${centre} ${height - bottom + 10})`}
+            >
+              {entry.driver.length > 34
+                ? `${entry.driver.slice(0, 33)}…`
+                : entry.driver}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
 type PieCardProps = {
   title: string;
   ariaLabel: string;
@@ -937,6 +1062,62 @@ function PieCard({
           <PieChart ariaLabel={ariaLabel} slices={slicesFor(month)} />
         ) : (
           <p className={styles.emptyNote}>{emptyNote ?? "No data available."}</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+/** "Promoter - Top 10 L2 Drivers" and siblings: ranked bars for one month. */
+function DriverCard({
+  title,
+  months,
+  entriesFor,
+  limit = 10
+}: {
+  title: string;
+  months: string[];
+  entriesFor: (month: string) => DriverEntry[];
+  limit?: number;
+}) {
+  const latest = months[months.length - 1] ?? "";
+  const [selected, setSelected] = useState(latest);
+  const month = months.includes(selected) ? selected : latest;
+
+  return (
+    <section className={styles.card}>
+      <div className={styles.cardHead}>
+        <div className={styles.cardHeadLeft}>
+          <small>UOM : Percentage</small>
+          <strong>{title}</strong>
+        </div>
+        <div className={styles.cardHeadRight}>
+          {months.length > 0 ? (
+            <select
+              className={styles.monthSelect}
+              value={month}
+              onChange={(event) => setSelected(event.target.value)}
+              aria-label={`${title} month`}
+            >
+              {[...months].reverse().map((option) => (
+                <option key={option} value={option}>
+                  {formatMonthKey(option)}
+                </option>
+              ))}
+            </select>
+          ) : null}
+        </div>
+      </div>
+      <div className={styles.chartBody}>
+        {month ? (
+          <DriverBarChart
+            entries={entriesFor(month).slice(0, limit)}
+            ariaLabel={`${title} chart`}
+          />
+        ) : (
+          <p className={styles.emptyNote}>
+            No driver data - the workbook&apos;s voice sheet supplies these.
+          </p>
         )}
       </div>
     </section>
@@ -1490,6 +1671,18 @@ export function ConnectedNpsDashboard({ fuel, title }: DashboardProps = {}) {
               <span className={styles.legendDetractor}>Detractor%</span>
             </div>
           </section>
+
+          <div className={styles.sectionBanner}>
+            Driver - Promoter, Passive, Detractor
+          </div>
+
+          <DriverCard
+            title="Promoter - Top 10 L2 Drivers"
+            months={model.driverMonths}
+            entriesFor={(month) =>
+              model.driversByMonth[month]?.promoter.l2 ?? []
+            }
+          />
 
           {model.warnings.length > 0 ? (
             <ul className={styles.warningList}>
